@@ -9,18 +9,15 @@ import networkx as nx
 from itertools import combinations
 import multiprocessing as mp
 import os, copy
-from bisect import bisect_left
+from typing import Tuple, List, Optional, Dict
+import pickle
 from pathlib import Path
-HERE = Path(__file__).parent
+import itertools
+from pathlib import Path
+HERE = Path(__file__).resolve().parent
 
 # ============ 常量 ============
-
-# === 段缓存目录（与预计算脚本一致） ===
-SEG_CACHE_DIR = str((HERE / "缓存").resolve())
-BASE_DIR = str((HERE).resolve())
-os.makedirs(SEG_CACHE_DIR, exist_ok=True)
-
-EXCEL = str((HERE.parent.parent / "C题附件：增加导线中间的开关和是否为干路两列.xlsx").resolve()) # 基本参数excel
+EXCEL = str((HERE.parent.parent / "C题附件：增加导线中间的开关和是否为干路两列.xlsx").resolve())
 V_BASE = 10e3        
 I_RATE = RATED_CURRENT = 220    # 额定电流 单位A
 DG_BASE = 300         # DG初始容量 单位kW
@@ -332,6 +329,22 @@ def make_nodal_power_dict(G):
     return P
 
 SQRT3 = math.sqrt(3)
+@njit
+def _compute_currents(R_arr, P_arr, U_line):
+    n = R_arr.shape[0]
+    I = np.zeros(n)
+    Psend = np.zeros(n)
+    for i in range(n):
+        Rk = R_arr[i]
+        Pk = P_arr[i]
+        if Rk > 0.0 and Pk != 0.0:
+            disc = U_line*U_line + 4*Rk*Pk*1e3
+            I_val = (SQRT3*(math.sqrt(disc)-U_line)) / (6.0*Rk)
+            I[i] = I_val if I_val>0.0 else 0.0
+        # 计算送端功率
+        Psend[i] = SQRT3*U_line*I[i]/1e3
+    return Psend, I
+
 def distflow_forward_backward(D, roots, P_nodal, debug=False):
     """
     改进的配电网前推回代潮流计算
@@ -508,36 +521,6 @@ def run_distflow(G):
             import traceback
             traceback.print_exc()
         return []
-# ---- 在 worker 进程内的潮流缓存（按状态键）----
-_RUN_CACHE = {}
-# ==== 统一状态键 & 潮流缓存 ====
-EVAL_CACHE = {}     # 候选评估全局缓存（每个worker进程内共享）
-_RUN_CACHE = {}     # 潮流结果缓存（按状态键）
-
-def statekey(net: nx.Graph):
-    """网络状态键：按(故障集合, 关键开关状态)唯一标识一个潮流状态"""
-    faults = tuple(sorted(
-        n for n, d in net.nodes(data=True)
-        if d.get('故障状态', False)
-    ))
-    sws = tuple(sorted(
-        (n, net.nodes[n].get('开关状态'))
-        for n, d in net.nodes(data=True)
-        if d.get('type') in ('分段开关', '联络开关', '断路器')
-    ))
-    return faults, sws
-
-def _state_key(net: nx.Graph):   # 兼容老名字（有人在其他地方调用）
-    return statekey(net)
-
-def run_distflow_cached(net: nx.Graph):
-    """带缓存的潮流计算"""
-    k = statekey(net)
-    v = _RUN_CACHE.get(k)
-    if v is None:
-        v = run_distflow(net)
-        _RUN_CACHE[k] = v
-    return v
 
 def is_reachable_from_cb(G, cb, target_node):
     powered_areas = []
@@ -853,57 +836,42 @@ class NetworkOperator:
         if reset:
             self._init_network_status()
 
-        # 1) 获取网络状态与分支 DG
+        # 1 获取网络状态
         branch_dg_list = self._branch_dgs(loc, self.G)
 
-        # 2) 计算“短路用户”的额外损失（_risk 里已处理，这里保留以备扩展）
+        # 2 计算用户短路额外损失
         node_data = self.G.nodes[loc]
         if node_data.get('type') == '用户':
             extra_lost = node_data['用电功率(kW)'] * TYPE_W[node_data['类型']]
         else:
-            extra_lost = 0.0
+            extra_lost = 0
 
-        # 3) 构建基础故障网络
+        # 3 构建基础故障网络
         net0 = copy.deepcopy(self.G)
         net0.nodes[loc]['故障状态'] = True
         if loc.startswith('L'):
             base_label = f"断路线路 {loc}"
-        elif loc.startswith('S') or loc.startswith('CB'):
-            net0.nodes[loc]['开关状态'] = '关'
+        elif loc.startswith('S') or loc.startswith('CB'):     
+            net0.nodes[loc]['开关状态'] = '关'     
             base_label = f"跳闸 {loc}"
-        elif loc.startswith('DG'):
-            net0.nodes[loc]['开关状态'] = '关'
+        elif loc.startswith('DG'):    
+            net0.nodes[loc]['开关状态'] = '关'     
             base_label = f"{loc}故障"
         else:
-            # 用户短路：把两侧导线直接并上，等价删除该用户节点
             lines = [n for n in net0.neighbors(loc)]
             if len(lines) >= 2:
                 u, v = lines[0], lines[1]
                 net0.add_edge(u, v, 联络边=False)
             base_label = f"短路用户 {loc}"
 
-        # ========== 候选生成：用 statekey 去重 ==========
-        candidates: list[tuple[nx.Graph, str]] = []
-        seen: set = set()
+        # 4 候选策略生成
+        candidates = []
+        # 公共基础策略
+        candidates.append((net0, base_label)) 
 
-        def add_candidate(net: nx.Graph, label: str):
-            """按 statekey 去重后加入候选"""
-            try:
-                k = statekey(net)  # 你已实现
-            except Exception:
-                # 兜底：即使 statekey 异常，也至少放进去一次
-                k = None
-            if (k is None) or (k not in seen):
-                candidates.append((net, label))
-                if k is not None:
-                    seen.add(k)
-
-        # 基础策略
-        add_candidate(net0, base_label)
-
-        # ---------- 故障类型1：打开上游最近的“关”开关 ----------
+        # 故障类型1：打开上游开关
         if ftype == 1:
-            # 找最近的分段/联络开关（且当前为“关”）
+            # 向上游 BFS 找最近的分段/联络开关
             visited, queue = set(), deque([loc])
             found_switch = None
             while queue:
@@ -911,87 +879,91 @@ class NetworkOperator:
                 if curr in visited:
                     continue
                 visited.add(curr)
+
                 if net0.nodes[curr]['type'] in ('分段开关', '联络开关') and net0.nodes[curr]['开关状态'] == '关':
                     found_switch = curr
                     break
                 queue.extend([nbr for nbr in net0.neighbors(curr) if nbr not in visited])
+            new_net = copy.deepcopy(net0)
+            new_net.nodes[found_switch]['开关状态'] = '开'
 
-            if found_switch is not None:
-                # 基础：仅打开该开关
-                base1 = copy.deepcopy(net0)
-                base1.nodes[found_switch]['开关状态'] = '开'
-                add_candidate(base1, f"打开开关 {found_switch}")
+            # 考虑接入原本由DG供应的用户后可能会出现过负荷的情形
+            overload = run_distflow(new_net)
+            if not overload:
+                candidates.append((new_net, f"打开开关 {found_switch}"))
+            else:
+                # 添加原始策略
+                candidates.append((new_net, f"打开开关 {found_switch}"))
+                # 过负荷的情况，添加联络线策略
+                switches = ['S8', 'S11', 'S12', 'S1', 'S2', 'S3', 'S4', 'S5', 'S29', 'S27', 'S62-3', 'S13-1', 'S29-2']
+                max_switch_num = 4  # 最大同时操作开关数量
+                key_ties = {'S13-1', 'S29-2', 'S62-3'}
 
-                # 若出现过载，再尝试联络组合
-                overload = run_distflow_cached(base1)
-                if overload:
-                    switches = ['S8', 'S11', 'S12', 'S1', 'S2', 'S3', 'S4', 'S5', 'S29', 'S27', 'S62-3', 'S13-1', 'S29-2']
-                    max_switch_num = 3
-                    key_ties = {'S13-1', 'S29-2', 'S62-3'}
-                    tie_switch_constraints = self._judge_main_fault_type(loc)
+                # 定义联络开关及其约束关系
+                tie_switch_constraints = {}
+                tie_switch_constraints = self._judge_main_fault_type(loc)
 
-                    for i in range(1, min(max_switch_num, len(switches)) + 1):
-                        for combo in combinations(switches, i):
-                            # 至少包含一个关键联络
-                            if not key_ties.intersection(combo):
-                                continue
-                            new_net = copy.deepcopy(base1)   # 注意：从 base1 出发，确保 found_switch 已打开
-                            label_parts = [f"开{found_switch}"]
-
-                            for sw in combo:
-                                if sw in new_net.nodes:
-                                    if new_net.nodes[sw]['开关状态'] == '关':
-                                        new_net.nodes[sw]['开关状态'] = '开'
-                                        label_parts.append(f"开{sw}")
-                                    else:
-                                        new_net.nodes[sw]['开关状态'] = '关'
-                                        label_parts.append(f"关{sw}")
-
-                            # 约束：若联络开，则约束集中至少一把为关
-                            valid = True
-                            for tie_sw, must_cut in tie_switch_constraints.items():
-                                if tie_sw in new_net.nodes and new_net.nodes[tie_sw]['开关状态'] == '开':
-                                    if not any(new_net.nodes[n]['开关状态'] == '关' for n in must_cut if n in new_net.nodes):
-                                        valid = False
-                                        break
-                            if valid:
-                                add_candidate(new_net, "操作：" + "+".join(label_parts))
-
-        # ---------- 故障类型5：组合开关操作 ----------
+                for i in range(1, min(max_switch_num, len(switches)) + 1):
+                    for combo in combinations(switches, i):
+                        # 判断是否包含至少一个关键联络开关
+                        if not key_ties.intersection(combo):
+                            continue
+                        new_net = copy.deepcopy(net0)
+                        label_parts = [f"打开开关{found_switch}"]
+                        for sw in combo:
+                            if sw in new_net.nodes:  
+                                if new_net.nodes[sw]['开关状态'] == '关':
+                                    new_net.nodes[sw]['开关状态'] = '开'
+                                    label_parts.append(f"开{sw}")
+                                else:
+                                    new_net.nodes[sw]['开关状态'] = '关'
+                                    label_parts.append(f"关{sw}")
+                        valid = True
+                        for sw in tie_switch_constraints:
+                            if sw in new_net.nodes and new_net.nodes[sw]['开关状态'] == '开':
+                                if not any(new_net.nodes[n]['开关状态'] == '关' for n in tie_switch_constraints[sw]):
+                                    valid = False
+                                    break
+                        if valid:
+                            candidates.append((new_net, "操作：" + "+".join(label_parts)))
+                
+        # 故障类型5：组合开关操作
         elif ftype == 5:
             switches = ['S8', 'S11', 'S12', 'S1', 'S2', 'S3', 'S4', 'S5', 'S29', 'S27', 'S62-3', 'S13-1', 'S29-2']
-            max_switch_num = 3
+            max_switch_num = 4 # 最大同时操作开关数量
+
+            # 定义联络开关及其约束关系
+            tie_switch_constraints = {}
             tie_switch_constraints = self._judge_main_fault_type(loc)
 
             for i in range(1, min(max_switch_num, len(switches)) + 1):
                 for combo in combinations(switches, i):
-                    new_net = net0.copy()
-
+                    new_net = copy.deepcopy(net0)
                     label_parts = []
                     for sw in combo:
-                        if sw in new_net.nodes:
+                        if sw in new_net.nodes:  
                             if new_net.nodes[sw]['开关状态'] == '关':
                                 new_net.nodes[sw]['开关状态'] = '开'
                                 label_parts.append(f"开{sw}")
                             else:
                                 new_net.nodes[sw]['开关状态'] = '关'
                                 label_parts.append(f"关{sw}")
-
                     valid = True
-                    for tie_sw, must_cut in tie_switch_constraints.items():
-                        if tie_sw in new_net.nodes and new_net.nodes[tie_sw]['开关状态'] == '开':
-                            if not any(new_net.nodes[n]['开关状态'] == '关' for n in must_cut if n in new_net.nodes):
+                    for sw in tie_switch_constraints:
+                        if sw in new_net.nodes and new_net.nodes[sw]['开关状态'] == '开':
+                            if not any(new_net.nodes[n]['开关状态'] == '关' for n in tie_switch_constraints[sw]):
                                 valid = False
                                 break
                     if valid:
-                        add_candidate(new_net, "操作：" + "+".join(label_parts))
-
-        # ---------- 故障类型3：断开分支 DG ----------
+                        candidates.append((new_net, "操作：" + "+".join(label_parts)))
+            
+        # 故障类型3：断开分支DG
         elif ftype == 3:
             for dg in branch_dg_list:
                 if dg not in net0.nodes:
                     continue
-                # 找 DG 上游最近的分段/联络开关（不限开关当前状态）
+
+                # (1) 向上游 BFS 找最近的分段/联络开关
                 visited, queue = set(), deque([dg])
                 found_switch = None
                 while queue:
@@ -999,128 +971,150 @@ class NetworkOperator:
                     if curr in visited:
                         continue
                     visited.add(curr)
+
                     if net0.nodes[curr]['type'] in ('分段开关', '联络开关'):
                         found_switch = curr
                         break
                     queue.extend([nbr for nbr in net0.neighbors(curr) if nbr not in visited])
 
                 if not found_switch:
-                    continue
+                    continue 
 
+                # (2) 生成临时网络：开 DG，关最近开关
                 tmp_net = copy.deepcopy(net0)
                 tmp_net.nodes[dg]['开关状态'] = '开'
                 if not loc.startswith('L'):
                     tmp_net.nodes[found_switch]['开关状态'] = '关'
 
-                # 删除该开关节点，计算 DG 可到达区域
+                # (3) 删除该开关节点，计算 DG 可到达区域
                 H = tmp_net.copy()
-                if found_switch in H:
-                    H.remove_node(found_switch)
+                H.remove_node(found_switch)
                 reachable = nx.node_connected_component(H, dg)
 
-                # 区域负荷（排除故障点）
+                # (4) 统计区域内用户负荷（不含故障节点）
                 load_sum = 0.0
                 for n in reachable:
                     n_data = tmp_net.nodes[n]
                     if n_data['type'] == '用户' and n != loc:
                         load_sum += n_data['用电功率(kW)']
 
+                # (5) 若 DG 能覆盖该负荷，才加入候选策略
                 if load_sum <= tmp_net.nodes[dg]['容量(kW)']:
-                    add_candidate(tmp_net, f"开{dg} + 断{found_switch}")
+                    candidates.append((tmp_net, f"开{dg} + 断{found_switch}"))
 
-        # 其它类型：仅保留基础策略
-        # ==============================================
+        # 其他类型仅保留基础策略
+        else:
+            pass
 
-        # 5) 评估候选：用 eval_cache（key=statekey）避免重复潮流计算
-        #eval_cache: dict = {}
-                # 5) 评估候选：用全局 EVAL_CACHE（key=statekey）避免重复潮流与重复打分
-        best_risk = (float('inf'), float('inf'), float('inf'))  # (lost, over_penalty, total)
-        best_strategy = base_label
-        best_overload = []
+        # 5 评估所有候选策略
+        best_risk      = (float('inf'), float('inf'), float('inf'))
+        best_strategy  = base_label
+        best_overload  = []         
 
         for net, label in candidates:
-            k = statekey(net)
+            # 检查各 CB 送电区域是否超额
+            for cb in ['CB1', 'CB2', 'CB3']:
+                if cb not in net.nodes:
+                    continue
+                if net.nodes[cb].get('故障状态', False):
+                    continue
 
-            if k in EVAL_CACHE:
-                # 命中缓存：直接取
-                lost, over_penalty, total, overload = EVAL_CACHE[k]
-            else:
-                # 潮流 + 过载罚分
-                overload = run_distflow_cached(net)
+                # 找 CB 可达区域
+                visited = set()
+                queue = deque([cb])
+                total_load = 0.0
 
-                # === 过载罚分 ===
-                w1, w2, threshold = 10.0, 10.0, 1.3
-                over_penalty = 0.0
-                for L, I in overload:
-                    ratio = I / I_RATE
-
-                    # 计算 w0（过载元件涉及的“权重×功率”）
-                    w_0 = 0.0
-                    if L in line_dict:
-                        U1, U2 = line_dict[L]
-                        U1_power = net.nodes[U1]['用电功率(kW)']
-                        U2_power = net.nodes[U2]['用电功率(kW)']
-                        U1_weight = TYPE_W[net.nodes[U1]['类型']]
-                        U2_weight = TYPE_W[net.nodes[U2]['类型']]
-                        w_0 = U1_weight * U1_power + U2_weight * U2_power
-                    elif L.startswith('CL'):
-                        if L == 'CL1':
-                            U = 'U1'
-                        elif L == 'CL2':
-                            U = 'U43'
-                        elif L == 'CL3':
-                            U = 'U23'
+                while queue:
+                    node = queue.popleft()
+                    if node in visited:
+                        continue
+                    visited.add(node)
+                    for nbr in net.neighbors(node):
+                        if nbr in visited:
+                            continue
+                        if net.nodes[nbr].get('故障状态', False):
+                            continue
+                        if net.nodes[nbr]['type'] in ['分段开关', '联络开关']:
+                            if net.nodes[nbr]['开关状态'] == '开':
+                                queue.append(nbr)
                         else:
-                            U = None
-                        if U:
-                            U_power = net.nodes[U]['用电功率(kW)']
-                            U_weight = TYPE_W[net.nodes[U]['类型']]
-                            w_0 = U_weight * U_power
-                    elif L.startswith('LT'):
-                        if L == 'LT_13_43':
-                            U1, U2 = 'U13', 'U43'
-                        elif L == 'LT_19_29':
-                            U1, U2 = 'U19', 'U29'
-                        elif L == 'LT_23_62':
-                            U1, U2 = 'U23', 'U62'
-                        else:
-                            U1 = U2 = None
-                        if U1 and U2:
-                            U1_power = net.nodes[U1]['用电功率(kW)']
-                            U2_power = net.nodes[U2]['用电功率(kW)']
-                            U1_weight = TYPE_W[net.nodes[U1]['类型']]
-                            U2_weight = TYPE_W[net.nodes[U2]['类型']]
-                            w_0 = U1_weight * U1_power + U2_weight * U2_power
+                            queue.append(nbr)
 
-                    if ratio <= 1.1:
-                        continue  # 未超 1.1，不罚
-                    if ratio <= threshold:
-                        over_penalty += w_0 * w1 * (ratio - 1.1)
-                    else:
-                        over_penalty += w_0 * w1 * (ratio - 1.1)
-                        over_penalty += w_0 * w2 * (1 + (ratio - threshold)) ** 2
+                # 汇总负荷
+                for n in visited:
+                    n_data = net.nodes[n]
+                    if n_data['type'] == '用户':
+                        total_load += n_data.get('用电功率(kW)', 0.0)
 
-                # === 失负荷（_risk 内部已对用户短路做额外损失处理）===
-                lost = self._risk(net, loc)
+            # 计算潮流
+            overload = run_distflow(net)
+            w1 = 10      # 1.1~1.3 倍区间线性权重
+            w2 = 10     # 超过 1.3 倍后二次权重
+            threshold = 1.3
+            over_penalty = 0.0
 
-                total = (lost + over_penalty)
+            for L, I in overload:
+                ratio = I / I_RATE
 
-                # 与原先一致：乘 1e4
-                total *= 1e4
-                lost *= 1e4
-                over_penalty *= 1e4
+                # 计算不同的过负荷线路影响的用户权重
+                w_0 = 0
+                if L in line_dict:
+                    U1, U2 = line_dict[L]
+                    U1_power = net.nodes[U1]['用电功率(kW)']
+                    U2_power = net.nodes[U2]['用电功率(kW)']
+                    U1_weight = TYPE_W[net.nodes[U1]['类型']]
+                    U2_weight = TYPE_W[net.nodes[U2]['类型']]
+                    w_0 = U1_weight * U1_power + U2_weight * U2_power
+                elif L.startswith('CL'):
+                    if L == 'CL1':
+                        U = 'U1'
+                    elif L == 'CL2':
+                        U = 'U43'
+                    elif L == 'CL3':
+                        U = 'U23'
+                    U_power = net.nodes[U]['用电功率(kW)']
+                    U_weight = TYPE_W[net.nodes[U]['类型']]
+                    w_0 = U_weight * U_power
+                elif L.startswith('LT'):
+                    if L == 'LT_13_43':
+                        U1 = 'U13'
+                        U2 = 'U43'
+                    elif L == 'LT_19_29':
+                        U1 = 'U19'
+                        U2 = 'U29'
+                    elif L == 'LT_23_62':
+                        U1 = 'U23'
+                        U2 = 'U62'
+                    U1_power = net.nodes[U1]['用电功率(kW)']
+                    U2_power = net.nodes[U2]['用电功率(kW)']
+                    U1_weight = TYPE_W[net.nodes[U1]['类型']]
+                    U2_weight = TYPE_W[net.nodes[U2]['类型']]
+                    w_0 = U1_weight * U1_power + U2_weight * U2_power
 
-                # 写入全局缓存
-                EVAL_CACHE[k] = (lost, over_penalty, total, overload)
+                if ratio <= threshold:
+                    # 1.1→1.3 线性累加
+                    over_penalty += w_0 * w1 * (ratio - 1.1) 
+                else:
+                    # 先把 >1.1 的线性罚分
+                    over_penalty += w_0 * w1 * (ratio - 1.1) 
+                    # 再把 >1.3 的部分二次放大
+                    over_penalty += w_0 * w2 * (1 +(ratio - threshold) ) ** 2 
+            
+            net2 = copy.deepcopy(net)
+            lost = self._risk(net2, loc)
+            total =lost + over_penalty 
+            # 结果乘以1e4，保持数据精度
+            total = total * 1e4
+            lost = lost * 1e4
+            over_penalty = over_penalty * 1e4
 
-            # 更新最优
+            # 更新最优策略
             if total < best_risk[2] or (total == best_risk[2] and over_penalty < best_risk[1]):
-                best_risk = (lost, over_penalty, total)
+                best_risk     = (lost, over_penalty, total)
                 best_strategy = label
-                best_overload = overload
+                best_overload = overload         
 
         return (*best_risk, best_strategy, best_overload)
-
 
     def _branch_dgs(self,node,net):
         comp = nx.node_connected_component(net,node)
@@ -1165,12 +1159,11 @@ class NetworkOperator:
                     found_switch = curr
                     break
                 queue.extend([nbr for nbr in net0.neighbors(curr) if nbr not in visited])
-            new_net = net0.copy()
-
+            new_net = copy.deepcopy(net0)
             new_net.nodes[found_switch]['开关状态'] = '开'
 
             # 考虑接入原本由DG供应的用户后可能会出现过负荷的情形
-            overload = run_distflow_cached(new_net)
+            overload = run_distflow(new_net)
             if not overload:
                 cands.append(( [("open", found_switch)], f"打开开关 {found_switch}" ))
             else:
@@ -1188,8 +1181,7 @@ class NetworkOperator:
                         # 判断是否包含至少一个关键联络开关
                         if not key_ties.intersection(combo):
                             continue
-                        new_net = net0.copy()
-
+                        new_net = copy.deepcopy(net0)
                         label_parts = [f"打开开关{found_switch}"]
                         ops = [("open", found_switch)]
                         for sw in combo:
@@ -1222,8 +1214,7 @@ class NetworkOperator:
             }
             for i in range(1, min(max_switch_num, len(switches)) + 1):
                 for combo in combinations(switches, i):
-                    new_net = net0.copy()
-
+                    new_net = copy.deepcopy(net0)
                     label_parts = []
                     ops = []
                     for sw in combo:
@@ -1383,30 +1374,18 @@ class NetworkOperator:
                                     if set(tie_switch_constraints_1[k]) & set(tie_switch_constraints_2[k])}
         
         # 检查是否符合约束关系
-        # 替换：按最终状态过滤候选（ops1/ops2 是 [("open"/"close", sw), ...]）
-        def _final_switch_states(base_net, ops1, ops2):
-            st = {n: base_net.nodes[n].get('开关状态')
-                for n, d in base_net.nodes(data=True)
-                if d.get('type') in ('分段开关', '联络开关', '断路器')}
-            for act, sw in (ops1 + ops2):
-                if sw in st:
-                    st[sw] = '开' if act == 'open' else '关'
-            return st
-
         filtered_combined = []
-        for ops1, ops2, label in combined:
-            st = _final_switch_states(net0, ops1, ops2)
-            ok = True
-            for tie, must_cut in tie_switch_constraints.items():
-                if st.get(tie) == '开':  # 打开联络
-                    if not any(st.get(c) == '关' for c in must_cut):  # 至少有一把约束开关为关
-                        ok = False
+        for combo, ops, label_parts in combined:
+            valid = True
+            for key, constraint_set in tie_switch_constraints.items():
+                # 如果key在combo中，则其约束开关至少有一个也在combo中
+                if key in combo:
+                    if not any(const_sw in combo for const_sw in constraint_set):
+                        valid = False
                         break
-            if ok:
-                filtered_combined.append((ops1, ops2, label))
-
+            if valid:
+                filtered_combined.append((combo, ops, label_parts))
         combined = filtered_combined
-
 
         # ---------- 评估所有候选 ----------
         def _merge_ops(ops1, ops2):
@@ -1423,7 +1402,7 @@ class NetworkOperator:
                     net.nodes[sw]['开关状态'] = '开' if act == 'open' else '关'
 
             # 计算潮流
-            overload = run_distflow_cached(net)
+            overload = run_distflow(net)
             w1 = 10      # 1.1~1.3 倍区间线性权重
             w2 = 10     # 超过 1.3 倍后二次权重
             threshold = 1.3
@@ -1509,69 +1488,75 @@ def device_category(loc):
     else:
         return 'other'
 
-# ---- 种子工具（32位安全）----
-U32_MASK = 0xFFFFFFFF
-def _u32(x: int) -> int:
-    return int(x) & U32_MASK
+# 初始化网络
+def init_worker(base_net, p_cond, prod_safe):
+    global TEMPLATE_G, op, P_COND, PROD_SAFE
+    TEMPLATE_G   = base_net
+    op           = NetworkOperator(base_net)
+    P_COND       = p_cond          
+    PROD_SAFE    = prod_safe       
 
-def _mix_seed(base: int, i: int, t: int) -> int:
-    # 轻量 avalanche，全部落到 32bit
-    s = (base ^ 0x9E3779B1) * 0x85EBCA77
-    s ^= (i + 1) * 0xC2B2AE3D
-    s ^= (t + 1) * 0x27D4EB2F
-    return _u32(s)
+# simulate_single：simulate_fault接口函数
+def simulate_single(loc):
+    _reset_graph()
 
-# ============ 优化部分：全局进程池管理 ============
-GLOBAL_POOL = None
-GLOBAL_POOL_INITIALIZED = False
+    ftype = op._determine_fault_type(loc)
+    lost, over, tot, strat, overload = op.simulate_fault(
+        ftype, loc, reset=False)
+    w = P_COND[loc]      # 计算概率         
+    return loc, lost, over, tot, strat, overload, w
 
-def cleanup_global_pool():
-    """清理全局进程池（避免在 atexit/KeyboardInterrupt 阶段阻塞）"""
-    global GLOBAL_POOL, GLOBAL_POOL_INITIALIZED
-    try:
-        if GLOBAL_POOL is not None:
-            # 尽量优雅关闭；任何一步出错都不阻塞退出
-            try:
-                GLOBAL_POOL.close()
-            except Exception:
-                pass
-            try:
-                GLOBAL_POOL.terminate()
-            except Exception:
-                pass
-            # 不强制 join，防止在解释器退出晚期卡住
-            try:
-                GLOBAL_POOL.join()
-            except Exception:
-                pass
-    finally:
-        GLOBAL_POOL = None
-        GLOBAL_POOL_INITIALIZED = False
+# simulate_double：simulate_two_faults接口函数
+def simulate_double(pair):
+    loc1, loc2 = pair
+    _reset_graph()
 
-# ========= 进程池与抽样表的全局状态 =========
-# 主进程缓存的抽样表
-GLOBAL_EVENTS = None
-GLOBAL_CDF = None
-GLOBAL_TOTAL_PROB = None
-GLOBAL_P_COND = None
-GLOBAL_PROD_SAFE = None
-# ========= 抽样表计算（主进程用） =========
-def _compute_sampling_tables(base_graph):
-    """给定基础图，计算抽样所需的 P_COND/PROD_SAFE/EVENTS/CDF/TOTAL_PROB"""
-    # 元件失效概率（与你原来一致）
+    lost, over, tot, strat = op.simulate_two_faults(loc1, loc2)
+    w = P_COND[loc1] * P_COND[loc2] / PROD_SAFE     # 计算概率  
+    return loc1, loc2, lost, over, tot, strat, w
+
+# 重置网络
+def _reset_graph():
+    g = op.G
+    for n, d0 in TEMPLATE_G.nodes(data=True):
+        d  = g.nodes[n]
+        d.clear();   d.update(d0)          
+    g.remove_edges_from(list(g.edges))      
+    g.add_edges_from(TEMPLATE_G.edges(data=True))
+
+def process_capacity(DG_capacity):
+    """
+    只传入DG_capacity（列表或一维数组），其余参数均在函数内推断。
+    完成一次基准网络初始化、概率计算、并行计算，并输出Excel结果（若已移除则仅打印累计）。
+    """
+    # 推断需要的常量
+    cap = DG_capacity[0] if isinstance(DG_capacity, (list, np.ndarray)) else DG_capacity
+    BASE_XLSX_DIR = r"C:\Users\xueyixian\Desktop\深圳杯\第二问\问题二_8.16_测试"
+    PROGRESS_INT = 100
+    cpu_num = max(1, mp.cpu_count() - 1)
+
+    # 生成一次已初始化好的基准网络BASE_NET
+    G_cap = copy.deepcopy(G)
+    dg_nodes = [n for n, d in G.nodes(data=True) if d.get('type') == '分布式能源']
+    for dg, dg_cap in zip(dg_nodes, DG_capacity):
+        G_cap.nodes[dg]['容量(kW)'] = dg_cap
+    op0 = NetworkOperator(G_cap)
+    BASE_NET = copy.deepcopy(op0.G)
+
+    # 初始故障概率
     p_fail = {}
-    for n, d in base_graph.nodes(data=True):
-        t = d['type']
-        if t == '导线':
+    for n, d in op0.G.nodes(data=True):
+        typ = d['type']
+        if typ == '导线':
             p_fail[n] = d['长度(km)'] * 0.002
-        elif t in ('分段开关', '联络开关', '断路器'):
-            p_fail[n] = 0.002
-        elif t in ('用户', '分布式能源'):
+        elif typ in ('用户', '分布式能源'):
             p_fail[n] = 0.005
+        elif typ in ('分段开关', '联络开关', '断路器'):
+            p_fail[n] = 0.002
         else:
             p_fail[n] = 0.0
     p_safe = {n: 1.0 - p for n, p in p_fail.items()}
-    # 候选故障事件
+
     all_faults = (
           [f"L{i}"  for i in range(1, 60)]
         + [f"U{i}"  for i in range(1, 63)]
@@ -1579,25 +1564,19 @@ def _compute_sampling_tables(base_graph):
         + ["CB1", "CB2", "CB3"]
         + [f"DG{i}" for i in range(1, 9)]
     )
-    single_args = [x for x in all_faults if x in base_graph.nodes]
-    double_args = [
-        (a, b) for a, b in combinations(all_faults, 2)
-        if device_category(a) != device_category(b)
-        and a in base_graph.nodes and b in base_graph.nodes
-    ]
-    # 按设备类别做条件化（“同类最多一个故障”）
     devices_by_category = {}
     for j in all_faults:
-        if j in base_graph.nodes:
+        if j in op0.G.nodes:
             category = device_category(j)
             if category not in devices_by_category:
                 devices_by_category[category] = []
             devices_by_category[category].append(j)
+
     category_probs = {}
     for category, devices in devices_by_category.items():
         prob_no_fault = np.prod([p_safe[d] for d in devices])
         prob_single_fault = sum(
-            p_fail[d] * np.prod([p_safe[o] for o in devices if o != d])
+            p_fail[d] * np.prod([p_safe[other] for other in devices if other != d])
             for d in devices
         )
         category_probs[category] = {
@@ -1605,1340 +1584,691 @@ def _compute_sampling_tables(base_graph):
             'single_fault': prob_single_fault,
             'devices': devices
         }
-    # 类内条件概率
+
     p_cond_category = {}
     for j in all_faults:
-        if j in base_graph.nodes:
+        if j in op0.G.nodes:
             category = device_category(j)
             cat_info = category_probs[category]
             p_j_fail = p_fail[j]
-            others   = [d for d in cat_info['devices'] if d != j]
-            p_others_safe = np.prod([p_safe[d] for d in others])
-            denom = cat_info['no_fault'] + cat_info['single_fault']
-            p_cond_category[j] = (p_j_fail * p_others_safe) / denom
-    # 类间“其余类别无故障”的条件化
-    category_no_fault_probs = {
-        cat: info['no_fault'] / (info['no_fault'] + info['single_fault'])
-        for cat, info in category_probs.items()
-    }
+            other_devices = [d for d in cat_info['devices'] if d != j]
+            p_others_safe = np.prod([p_safe[d] for d in other_devices])
+            denominator = cat_info['no_fault'] + cat_info['single_fault']
+            p_cond_category[j] = (p_j_fail * p_others_safe) / denominator
+
+    category_no_fault_probs = {}
+    for category, cat_info in category_probs.items():
+        category_no_fault_probs[category] = cat_info['no_fault'] / (cat_info['no_fault'] + cat_info['single_fault'])
     prod_safe_all = np.prod(list(category_no_fault_probs.values()))
+
     p_cond = {}
     for j in all_faults:
-        if j in base_graph.nodes:
+        if j in op0.G.nodes:
             category = device_category(j)
-            other_prob = 1.0
-            for oc in category_no_fault_probs:
-                if oc != category:
-                    other_prob *= category_no_fault_probs[oc]
-            p_cond[j] = p_cond_category[j] * other_prob
-    # 事件列表 + 权重
-    event_single = single_args
-    w_single = np.array([p_cond[x] for x in event_single])
-    event_double = double_args
-    w_double = np.array([p_cond[a] * p_cond[b] / prod_safe_all for a, b in event_double])
-    events = event_single + event_double
-    weights = np.concatenate([w_single, w_double])
-    cdf = np.cumsum(weights)
-    total_prob = float(cdf[-1]) if len(cdf) else 0.0
+            other_cats_prob = 1.0
+            for other_cat in category_no_fault_probs.keys():
+                if other_cat != category:
+                    other_cats_prob *= category_no_fault_probs[other_cat]
+            p_cond[j] = p_cond_category[j] * other_cats_prob
 
-    return p_cond, prod_safe_all, events, cdf, total_prob
+    # [已移除 Excel 写入逻辑]
+    sum_risk = 0.0
+    sum_loss = 0.0
+    sum_over = 0.0
+    row_count = 1
 
-# ========= worker 初始化（广播抽样表 + 基础图） =========
-def init_worker(base_graph, p_cond, prod_safe, events, cdf, total_prob, rng_seed=2025):
-    """每个 worker 启动时拿到共享的抽样表和基础图"""
-    global BASE_GRAPH, P_COND, PROD_SAFE, EVENTS, CDF, TOTAL_PROB, RNG
-    BASE_GRAPH = base_graph
-    P_COND = p_cond
-    PROD_SAFE = prod_safe
-    EVENTS = events
-    CDF = cdf
-    TOTAL_PROB = total_prob
+    def write_row(data, sheet=None, workbook=None, path=None, accumulators=None):
+        """只做累计统计；保留原调用位置但不再写入 Excel。"""
+        sum_risk, sum_loss, sum_over, row_count = accumulators
+        weight = data.get("w", 0.0)
+        sum_risk += data.get("tot", 0.0) * weight
+        sum_loss += data.get("lost", 0.0) * weight
+        sum_over += data.get("over_penalty", 0.0) * weight
+        row_count += 1
+        return (sum_risk, sum_loss, sum_over, row_count)
 
-    # 独立可复现的随机种子
-    pid = os.getpid()
-    seed = _u32(rng_seed + (pid % 1000))     # <== 32位
-    RNG = np.random.default_rng(seed)
-
-def create_operator_with_capacities(dg_capacities):
-    """每次从 BASE_GRAPH 复制并覆盖 DG 容量，再构造 NetworkOperator"""
-    G_cap = copy.deepcopy(BASE_GRAPH)
-    for n, d in G_cap.nodes(data=True):
-        if d.get('type') == '分布式能源':
-            G_cap.nodes[n]['容量(kW)'] = float(dg_capacities[n])
-    return NetworkOperator(G_cap)
-
-# simulate_single：simulate_fault接口函数
-# def simulate_single(args):
-#     """修改为接收(loc, dg_capacities)元组"""
-#     loc, dg_capacities = args
-    
-#     # 根据DG容量创建NetworkOperator
-#     op = create_operator_with_capacities(dg_capacities)
-    
-#     ftype = op._determine_fault_type(loc)
-#     lost, over, tot, strat, overload = op.simulate_fault(
-#         ftype, loc, reset=False)
-#     w = P_COND[loc]
-#     return loc, lost, over, tot, strat, overload, w
-def _state_key(net):
-    faults = tuple(sorted(n for n, d in net.nodes(data=True)
-                          if d.get('故障状态', False)))
-    sws = tuple(sorted(
-        (n, net.nodes[n].get('开关状态'))
-        for n, d in net.nodes(data=True)
-        if d.get('type') in ('分段开关', '联络开关', '断路器')
-    ))
-    statekey = _state_key
-    return faults, sws
-
-# simulate_double：simulate_two_faults接口函数
-# def simulate_double(args):
-    
-#     """修改为接收(pair, dg_capacities)元组"""
-#     pair, dg_capacities = args
-#     loc1, loc2 = pair
-   
-   
-#     # 根据DG容量创建NetworkOperator
-#     op = create_operator_with_capacities(dg_capacities)
-   
-#     lost, over, tot, strat = op.simulate_two_faults(loc1, loc2)
-#     w = P_COND[loc1] * P_COND[loc2] / PROD_SAFE
-#     return loc1, loc2, lost, over, tot, strat, w
-
-# ========= 抽样与场景评估（worker 用） =========
-def _draw():
-    r = RNG.random()
-    idx = np.searchsorted(CDF, r * TOTAL_PROB, side='right')
-    return EVENTS[min(idx, len(EVENTS)-1)]
-# ---- 每个 worker 复用 OP（按容量指纹缓存）----
-OPERATOR = None
-OP_CAP_SIG = None
-
-def _cap_sig(d):
-    # 容量向量的稳定指纹
-    return tuple((k, round(float(v), 6)) for k, v in sorted(d.items()))
-
-def _get_operator(dg_capacities):
-    global OPERATOR, OP_CAP_SIG
-    sig = _cap_sig(dg_capacities)
-    if OPERATOR is None or OP_CAP_SIG != sig:
-        OPERATOR = create_operator_with_capacities(dg_capacities)
-        OP_CAP_SIG = sig
-    return OPERATOR
-def simulate_single(args):
-    loc, dg_capacities = args
-    op = _get_operator(dg_capacities)  # ← 复用
-    ftype = op._determine_fault_type(loc)
-    lost, over, tot, strat, overload = op.simulate_fault(ftype, loc, reset=False)
-    w = P_COND[loc]
-    return loc, lost, over, tot, strat, overload, w
-
-def simulate_double(args):
-    pair, dg_capacities = args
-    loc1, loc2 = pair
-    op = _get_operator(dg_capacities)  # ← 复用
-    lost, over, tot, strat = op.simulate_two_faults(loc1, loc2)
-    w = P_COND[loc1] * P_COND[loc2] / PROD_SAFE
-    return loc1, loc2, lost, over, tot, strat, w
-
-def run_scenario(args):
-    _dummy, dg_capacities = args
-    s = _draw()
-    if isinstance(s, tuple):
-        loc1, loc2 = s
-        _, _, lost, over, tot, *_ = simulate_double(((loc1, loc2), dg_capacities))
-    else:
-        loc = s
-        _, lost, over, tot, *_ = simulate_single((loc, dg_capacities))
-    return lost, over, tot
-
-def run_batch(args):
-    """
-    每个worker一次性完成 n_batch 个样本，减少IPC和pickle开销。
-    args: (base_seed, dg_capacities, n_batch, batch_id)
-    返回: (loss_sum, over_sum, tot_sum, n_done)
-    """
-    base_seed, dg_capacities, n_batch, batch_id = args
-
-    # 每批有独立RNG，保证可复现且与批数量无关
-    rng = np.random.default_rng(_u32(base_seed + 0x9E3779B1 * (batch_id + 1)))
-
-    loss_sum = 0.0
-    over_sum = 0.0
-    tot_sum  = 0.0
-
-    # 直接用抽样表（EVENTS/CDF/TOTAL_PROB）+ 本地rng采样
-    for _ in range(n_batch):
-        r = rng.random()
-        idx = np.searchsorted(CDF, r * TOTAL_PROB, side='right')
-        s = EVENTS[min(idx, len(EVENTS) - 1)]
-
-        if isinstance(s, tuple):
-            loc1, loc2 = s
-            _, _, lost, over, tot, *_ = simulate_double(((loc1, loc2), dg_capacities))
-        else:
-            loc = s
-            _, lost, over, tot, *_ = simulate_single((loc, dg_capacities))
-
-        loss_sum += lost
-        over_sum += over
-        tot_sum  += tot
-
-    return loss_sum, over_sum, tot_sum, n_batch
-
-# ========= 复用全局池的 Monte Carlo（主进程用） =========
-# ========= 复用全局池，但用“完全遍历”替换 Monte Carlo =========
-def monte_carlo_simulation(dg_capacities,
-                           total_samples=4000,
-                           rng_seed=2026,
-                           batches=None):
-    """
-    穷举：单故障 + 跨类别双故障。
-    机制保持原状：仍用 simulate_single / simulate_double 两段 imap_unordered。
-    新增：进度打印（步数触发 + 每5秒触发）并 flush=True。
-    """
-    import time
-    from itertools import combinations
-
-    global GLOBAL_POOL, GLOBAL_POOL_INITIALIZED
-    global GLOBAL_EVENTS, GLOBAL_CDF, GLOBAL_TOTAL_PROB, GLOBAL_P_COND, GLOBAL_PROD_SAFE
-
-    t0_all = time.perf_counter()
-
-    # 1) 首次计算概率表（含 P_COND、PROD_SAFE），后续复用
-    if GLOBAL_P_COND is None or GLOBAL_PROD_SAFE is None or GLOBAL_EVENTS is None:
-        GLOBAL_P_COND, GLOBAL_PROD_SAFE, GLOBAL_EVENTS, GLOBAL_CDF, GLOBAL_TOTAL_PROB = \
-            _compute_sampling_tables(G)
-
-    # 2) 如进程池未初始化则创建（只一次），通过 initializer 广播只读数据
-    if not GLOBAL_POOL_INITIALIZED:
-        num_workers = max(1, os.cpu_count() - 1)  # 按机器核数调整
-        GLOBAL_POOL = mp.Pool(
-            num_workers,
-            initializer=init_worker,
-            initargs=(G, GLOBAL_P_COND, GLOBAL_PROD_SAFE, GLOBAL_EVENTS,
-                      GLOBAL_CDF, GLOBAL_TOTAL_PROB, _u32(rng_seed))
-        )
-        GLOBAL_POOL_INITIALIZED = True
-
-    # Debug：当前这次评估的 DG 容量
-    print(dg_capacities, flush=True)
-
-    # 3) 事件清单（单/双故障；双故障只取跨类别）
-    all_faults = (
-          [f"L{i}"  for i in range(1, 60)]
-        + [f"U{i}"  for i in range(1, 63)]
-        + [f"S{i}"  for i in range(1, 30)] + ["S13-1", "S29-2", "S62-3"] + ["CB1", "CB2", "CB3"]
-        + [f"DG{i}" for i in range(1, 9)]
-    )
-
-    single_args = [x for x in all_faults if x in G.nodes]
+    # ---------- 组合清单 ----------
+    single_args = [loc for loc in all_faults if loc in op0.G.nodes]
     double_args = [
         (a, b) for a, b in combinations(all_faults, 2)
         if device_category(a) != device_category(b)
-        and a in G.nodes and b in G.nodes
+        and a in op0.G.nodes and b in op0.G.nodes
     ]
 
-    # 4) 并行遍历（单故障 → simulate_single；双故障 → simulate_double）
-    exp_loss = 0.0
-    exp_over = 0.0
-    exp_risk = 0.0
+    # ===== 单一进程池：先单后双（但双故障用“无 L + 外推”的估计法）=====
+    with mp.Pool(processes=cpu_num,
+                 initializer=init_worker,
+                 initargs=(op0.G, p_cond, prod_safe_all)) as pool:
 
-    # ---------- 单故障 ----------
-    total_single = len(single_args)
-    if total_single > 0:
-        t0 = time.perf_counter()
-        last_print = t0
-        # 约打印 ~20 次，至少每 100 个样本打印一次
-        step_single = max(1, min(100, total_single // 20))
+        print(f"启动任务：{len(single_args)} 单故障 + {len(double_args)} 双故障")
 
+        # ---------- 单故障（保持不变） ----------
         cnt = 0
-        for loc, lost, over, tot, strat, overload, w in GLOBAL_POOL.imap_unordered(
-                simulate_single, [(loc, dg_capacities) for loc in single_args], chunksize=1):
-            exp_loss += lost * w
-            exp_over += over * w
-            exp_risk += tot  * w
+        for result in pool.imap_unordered(simulate_single, single_args, chunksize=1):
+            loc, lost, over, tot, strat, overload, w = result
             cnt += 1
+            if cnt % PROGRESS_INT == 0:
+                print(f"  单故障进度 {cnt}/{len(single_args)}")
 
-            now = time.perf_counter()
-            if (cnt % step_single == 0) or (now - last_print > 5.0) or (cnt == total_single):
-                elapsed = now - t0
-                rate = cnt / max(elapsed, 1e-9)
-                eta = (total_single - cnt) / max(rate, 1e-9)
-                pct = 100.0 * cnt / total_single
-                print(f"[单故障] {cnt}/{total_single} ({pct:5.1f}%) | "
-                      f"E_over={exp_over:.4f} E(risk)={exp_risk:.4f} | "
-                      f"elapsed {elapsed:6.1f}s ETA {eta:6.1f}s",
-                      flush=True)
-                last_print = now
+            accumulators = write_row({
+                "capacity": cap,
+                "type": "single",
+                "loc": loc,
+                "best_strategy": strat,
+                "lost": lost,
+                "over_penalty": over,
+                "tot": tot,
+                "overload_lines": ";".join(f"{bid}:{I:.1f}A" for bid, I in overload),
+                "w": w
+            }, None, None, None, (sum_risk, sum_loss, sum_over, row_count))
+            sum_risk, sum_loss, sum_over, row_count = accumulators
 
-    # ---------- 双故障（跨类别；仅遍历不含'L'，并按比例外推） ----------
-    ESTIMATE_DOUBLE_RATIO = 0.469760170738439
+            if cnt % PROGRESS_INT == 0:
+                print(f"[{cap} kW] E(loss)={sum_loss:,.2f} E(over)={sum_over:,.2f} "
+                      f"E(risk)={sum_risk:,.2f}")
 
-    # 仅保留不含 'L' 的双故障组合（排除所有以 'L' 开头的元件，如 Lxx、LT_xx 等）
-    double_args_nol = [(a, b) for (a, b) in double_args
-                    if not (a.startswith('L') or b.startswith('L'))]
-    total_double = len(double_args_nol)
+        # ---------- 双故障（估计法：仅遍历“不含 L”组合，并按比例外推） ----------
+        # 再按固定比例 0.469760170738439 外推到“全部双故障”的贡献。:contentReference[oaicite:2]{index=2}
+        ESTIMATE_DOUBLE_RATIO = 0.469760170738439  
+        double_args_nol = [(a, b) for (a, b) in double_args
+                           if not (a.startswith('L') or b.startswith('L'))]  # :contentReference[oaicite:4]{index=4}
 
-    sum_lossw = 0.0
-    sum_overw = 0.0
-    sum_totw  = 0.0
+        # 为了打印“估计中的总体期望”，记录单故障结束时的基线
+        base_sum_loss, base_sum_over, base_sum_risk = sum_loss, sum_over, sum_risk
+        sum_lossw = 0.0   # 仅统计“不含 L”的累加（未外推）
+        sum_overw = 0.0
+        sum_totw  = 0.0
 
-    if total_double > 0:
-        t0 = time.perf_counter()
-        last_print = t0
-        step_double = max(1, min(100, total_double // 20))
+        print(f"  双故障将仅遍历无 'L' 组合：{len(double_args_nol)} 个，外推比例系数 {ESTIMATE_DOUBLE_RATIO}")
 
-        cnt = 0
-        for loc1, loc2, lost, over, tot, strat, w in GLOBAL_POOL.imap_unordered(
-                simulate_double, [((a, b), dg_capacities) for (a, b) in double_args_nol], chunksize=8):
-            # 仅累计“不含L”的双故障加权和
+        cnt2 = 0
+        for result in pool.imap_unordered(simulate_double, double_args_nol, chunksize=1):
+            loc1, loc2, lost, over, tot, strat, w = result
+            cnt2 += 1
+
+            # 1) 先累计“未外推”的权重和（用于进度中的近似显示）
             sum_lossw += lost * w
             sum_overw += over * w
             sum_totw  += tot  * w
-            cnt += 1
 
-            # 进度打印：用“不含L”遍历的外推值进行预估显示
-            now = time.perf_counter()
-            if (cnt % step_double == 0) or (now - last_print > 5.0) or (cnt == total_double):
-                elapsed = now - t0
-                rate = cnt / max(elapsed, 1e-9)
-                eta = (total_double - cnt) / max(rate, 1e-9)
-                pct = 100.0 * cnt / total_double
-                approx_double_risk = sum_totw / ESTIMATE_DOUBLE_RATIO
-                approx_E_over = exp_over + sum_overw / ESTIMATE_DOUBLE_RATIO
-                print(f"[双故障(无'L'外推)] {cnt}/{total_double} ({pct:5.1f}%) | "
-                    f"E_over≈{approx_E_over:.4f} E(risk)≈{(exp_risk + approx_double_risk):.4f} | "
-                    f"elapsed {elapsed:6.1f}s ETA {eta:6.1f}s",
-                    flush=True)
-                last_print = now
+            # 2) 真正计入总账时：把权重放大为 w / ratio，相当于把“不含 L”的样本外推到“全部双故障”
+            w_scaled = w / ESTIMATE_DOUBLE_RATIO
+            accumulators = write_row({
+                "capacity": cap,
+                "type": "double_est",   # 标注：双故障（估计）
+                "loc": f"{loc1}+{loc2}",
+                "best_strategy": strat,
+                "lost": lost,
+                "over_penalty": over,
+                "tot": tot,
+                "overload_lines": "-",
+                "w": w_scaled
+            }, None, None, None, (sum_risk, sum_loss, sum_over, row_count))
+            sum_risk, sum_loss, sum_over, row_count = accumulators
 
-    # 外推：把不含'L'的加权和按比例放大，代表整体双故障，再与单故障累加
-    exp_loss += sum_lossw / ESTIMATE_DOUBLE_RATIO
-    exp_over += sum_overw / ESTIMATE_DOUBLE_RATIO
-    exp_risk += sum_totw  / ESTIMATE_DOUBLE_RATIO
+            if cnt2 % PROGRESS_INT == 0 or cnt2 == len(double_args_nol):
+                approx_E_over = base_sum_over + (sum_overw / ESTIMATE_DOUBLE_RATIO)
+                approx_E_risk = base_sum_risk + (sum_totw  / ESTIMATE_DOUBLE_RATIO)
+                print(f"  双故障估计进度 {cnt2}/{len(double_args_nol)} | "
+                      f"E(over)≈{approx_E_over:,.2f} E(risk)≈{approx_E_risk:,.2f}") 
 
-    elapsed_all = time.perf_counter() - t0_all
-    print(f"遍历完成：单{len(single_args)}+双{len(double_args)}个场景；"
-          f"E(loss)={exp_loss:.4f}, E(over)={exp_over:.4f}, E(risk)={exp_risk:.4f}，"
-          f"总耗时{elapsed_all:.2f}s", flush=True)
+    # （收尾汇总打印；不再写Excel）
+    print(f"[{cap} kW] E(loss)={sum_loss:,.2f} E(over)={sum_over:,.2f} E(risk)={sum_risk:,.2f}")
 
-    # 与原接口一致：返回期望风险
-    return float(exp_risk)
-
-# ========= 用户需提供的黑盒损失函数 =========
-def loss_fn(t: int, x_t: np.ndarray, mc_seed: int | None = None) -> float:
-    dg_capacities = {f'DG{k+1}': float(x_t[k]) for k in range(8)}
-    return float(monte_carlo_simulation(
-        dg_capacities,
-        rng_seed = 0 if mc_seed is None else _u32(mc_seed)
-    ))
-def make_segmented_loss_evaluator(
-    lo: np.ndarray,
-    up: np.ndarray,
-    breaks,                         # {(t,k): [..]} 或 {k:[..]} 或 [..]
-    representative: str = "midpoint",   # "midpoint" | "left" | "right"
-    base_seed: int = 0,                 # 固定每段的 MC 随机种子
-    include_mc_seed_in_cache: bool = False,  # True 时把 mc_seed 也并入缓存键（命中率会下降）
-    monte_carlo_func=None,              # 默认用全局 monte_carlo_simulation(dg_capacities, rng_seed=..)
-):
+# ========= 分段缓存管理器（统一缓存池） =========
+class SegmentCacheManager:
     """
-    返回:
-      loss_eval(t:int, x_t:np.ndarray, mc_seed:int|None) -> float
-      helper: 一个小工具对象，含：
-        - edges_of(t,k) -> List[float]
-        - segment_of(t,k,x) -> int
-        - rep_of(t,k,seg_idx) -> float
-        - cache_size() -> int
-        - clear_cache() -> None
-        - eval_key(t, seg_tuple[8]) -> float  # 强制计算某段并缓存
-    约定:
-      - 分段使用左闭右开 [L,R)，x==up 归入最后一段。
-      - breaks 支持三种写法：
-          {(t,k): [b...]}, {k:[b...]}, 或 [b...]
-        实际有效断点为 (lo,up) 内部的断点 + 两端 lo/up，并自动去重。
-      - 默认忽略外部 mc_seed，使得“段内常量”且强缓存命中最大化。若你确实需要让
-        不同 mc_seed 触发不同评估，把 include_mc_seed_in_cache 设 True（不推荐）。
+    管理分段常值函数的缓存
+    缓存仅与DG的实际供电量有关，与时间无关
     """
-    assert lo.shape == (12, 8) and up.shape == (12, 8)
-    lo = np.asarray(lo, float)
-    up = np.asarray(up, float)
-
-    # ========== 小工具：32bit 安全混合 ==========
-    U32 = 0xFFFFFFFF
-    def _u32(x: int) -> int:
-        return int(x) & U32
-    def _mix(seed: int, *vals: int) -> int:
-        s = _u32(seed)
-        for v in vals:
-            s = _u32((s ^ 0x9E3779B1) * 0x85EBCA77 + int(v) * 0xC2B2AE3D)
-        return s
-
-    # ========== 规范化断点 breaks 到 {(t,k): [...]} ==========
-    def _norm_breaks(bks):
-        if isinstance(bks, list):
-            arr = sorted(float(x) for x in bks)
-            return {(t, k): arr[:] for t in range(1, 13) for k in range(1, 9)}
-        assert isinstance(bks, dict)
-        # 可能是 {(t,k):[..]} 或 {k:[..]}
-        keyed_by_tk = any(isinstance(k, tuple) and len(k) == 2 for k in bks)
-        out = {}
-        if keyed_by_tk:
-            for (t, k), arr in bks.items():
-                out[(int(t), int(k))] = sorted(float(x) for x in arr)
-        else:
-            for k, arr in bks.items():
-                arr = sorted(float(x) for x in arr)
-                for t in range(1, 13):
-                    out[(t, int(k))] = arr[:]
-        return out
-
-    BK = _norm_breaks(breaks)
-
-    # ========== 构造每个(t,k)的 edges（含 lo/up） ==========
-    # edges[t-1][k-1] = [e0=lo, e1, ..., eM=up]
-    edges: list[list[list[float]]] = [[[] for _ in range(8)] for __ in range(12)]
-    for t in range(1, 13):
-        for k in range(1, 9):
-            lo_tk = float(lo[t-1, k-1])
-            up_tk = float(up[t-1, k-1])
-            if up_tk < lo_tk + 1e-12:  # 退化为单点
-                edges[t-1][k-1] = [lo_tk, lo_tk]
-                continue
-            inner = [b for b in BK.get((t, k), []) if lo_tk < b < up_tk]
-            arr = [lo_tk] + inner + [up_tk]
-            # 去重
-            dedup = [arr[0]]
-            for v in arr[1:]:
-                if v - dedup[-1] > 1e-9:
-                    dedup.append(v)
-            if len(dedup) == 1:  # 极端保护
-                dedup = [lo_tk, up_tk]
-            edges[t-1][k-1] = dedup
-
-    # ========== 段索引/代表点 ==========
-    def _seg_index(t: int, k: int, x: float) -> int:
-        """左闭右开：找到 i 使 edges[i] <= x < edges[i+1]；x==up 归入最后一段"""
-        ed = edges[t-1][k-1]
-        pos = bisect_left(ed, x)   # 第一个 >= x 的位置
-        i = pos - 1
-        if i < 0:
-            i = 0
-        if i > len(ed) - 2:
-            i = len(ed) - 2
-        return i
-
-    def _rep_point(t: int, k: int, i: int) -> float:
-        ed = edges[t-1][k-1]
-        a, b = ed[i], ed[i+1]
-        if representative == "left":
-            return a
-        if representative == "right":
-            return np.nextafter(b, a)  # 轻移到右端内侧
-        return 0.5 * (a + b)          # midpoint
-
-    # ========== 默认 Monte Carlo 函数 ==========
-    if monte_carlo_func is None:
-        # 使用全局已定义的 monte_carlo_simulation(dg_capacities, rng_seed)
-        def monte_carlo_func(dg_capacities: dict, rng_seed: int) -> float:
-            return float(monte_carlo_simulation(dg_capacities, rng_seed=rng_seed))
-
-    cache: dict[tuple, float] = {}
-
-    # ---------- 缓存指纹：确保不会把“别的题”的缓存装进来 ----------
-    import hashlib, json, pickle, gzip, os, time
-
-    def _problem_fingerprint() -> str:
+    def __init__(self, cache_file: Optional[str] = None):
+        self.cache: Dict[int, float] = {}  # segment_id -> 函数值（与时间无关）
+        self.segments: List[Tuple[np.ndarray, np.ndarray]] = []  # [(lower_bounds, upper_bounds), ...]
+        self.cache_file = cache_file
+        self.hit_count = 0
+        self.miss_count = 0
+        
+        # 如果指定了缓存文件，尝试加载
+        if cache_file and Path(cache_file).exists():
+            self.load_cache()
+    
+    def define_segments_cartesian(self, dim_breakpoints: List[List[float]]):
         """
-        把影响 loss_eval 结果的核心信息做成短哈希：
-          - 代表点策略/是否含 mc_seed
-          - 分段边界 edges（每个t,k的边列表）
-          - lo/up（限制域）
-          - base_seed（决定MC的可复现序列）
-        注意：若你改了 Monte Carlo 的实现/抽样表构造，也建议换 base_seed 或在外层换文件名。
+        通过笛卡尔积方式定义分段区间
+        dim_breakpoints: 长度为8的列表，每个元素是该维度的分段点列表
         """
-        payload = {
-            "rep": representative,
-            "include_mc_seed": bool(include_mc_seed_in_cache),
-            "base_seed": int(base_seed),
-            "edges": [[[float(x) for x in edges[t][k]] for k in range(8)] for t in range(12)],
-            "lo": lo.tolist(),
-            "up": up.tolist(),
-        }
-        s = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        return hashlib.sha1(s.encode("utf-8")).hexdigest()[:16]
-
-    def _save_cache(path: str) -> dict:
-        """把当前内存cache落盘（gzip+pickle）。返回meta，方便打印日志。"""
-        meta = {
-            "version": 1,
-            "fingerprint": _problem_fingerprint(),
-            "ts": time.time(),
-            "size": len(cache),
-        }
-        obj = {"meta": meta, "data": cache}
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with gzip.open(path, "wb") as f:
-            pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
-        return meta
-
-    def _load_cache(path: str, strict: bool = True, merge: str = "union") -> dict:
+        assert len(dim_breakpoints) == 8, "需要8个维度的分段点"
+        
+        segments = []
+        
+        # 为每个维度生成区间 [a, b)
+        dim_intervals = []
+        for dim_idx, breakpoints in enumerate(dim_breakpoints):
+            sorted_points = sorted(breakpoints)
+            intervals = []
+            
+            # 添加第一个区间 (-inf, first_point)
+            intervals.append((-np.inf, sorted_points[0]))
+            
+            # 添加中间区间
+            for i in range(len(sorted_points) - 1):
+                intervals.append((sorted_points[i], sorted_points[i+1]))
+            
+            # 添加最后一个区间 [last_point, +inf)
+            intervals.append((sorted_points[-1], np.inf))
+            
+            dim_intervals.append(intervals)
+        
+        # 生成笛卡尔积
+        for interval_combination in itertools.product(*dim_intervals):
+            lower = np.array([interval[0] for interval in interval_combination])
+            upper = np.array([interval[1] for interval in interval_combination])
+            segments.append((lower, upper))
+        
+        self.segments = segments
+        print(f"通过笛卡尔积生成了 {len(segments)} 个分段区间")
+        
+        # 打印统计信息
+        for i, breakpoints in enumerate(dim_breakpoints):
+            print(f"  DG{i+1}: {len(breakpoints)} 个分段点 -> {len(breakpoints)+1} 个区间")
+    
+    def find_segment(self, actual_power: np.ndarray) -> Optional[int]:
         """
-        从磁盘加载缓存：
-          - strict=True：指纹不匹配则拒绝加载并返回空meta
-          - merge:
-              "replace" 覆盖当前内存cache；
-              "update"  以磁盘为准覆盖当前相同key；
-              "union"   只补充当前没有的key（推荐）
-        返回已加载的meta；如果文件不存在或被拒绝，返回 {}。
+        根据实际供电量找到所属的分段区间索引
+        actual_power: 8维向量，表示8个DG的实际供电量
         """
-        if not os.path.exists(path):
-            return {}
+        for i, (lower, upper) in enumerate(self.segments):
+            # 检查是否在区间 [lower, upper) 内
+            if np.all(actual_power >= lower) and np.all(actual_power < upper):
+                return i
+        return None
+    
+    def get_cached_value(self, actual_power: np.ndarray) -> Optional[float]:
+        """
+        尝试从缓存获取值（与时间无关）
+        actual_power: 8维向量，DG的实际供电量
+        """
+        seg_idx = self.find_segment(actual_power)
+        if seg_idx is not None:
+            if seg_idx in self.cache:
+                self.hit_count += 1
+                return self.cache[seg_idx]
+        return None
+    
+    def set_cached_value(self, actual_power: np.ndarray, value: float):
+        """
+        将计算结果存入缓存（与时间无关）
+        actual_power: 8维向量，DG的实际供电量
+        value: 目标函数值
+        """
+        seg_idx = self.find_segment(actual_power)
+        if seg_idx is not None:
+            self.cache[seg_idx] = value
+            self.miss_count += 1
+    
+    def save_cache(self):
+        """保存缓存到文件"""
+        if self.cache_file:
+            with open(self.cache_file, 'wb') as f:
+                pickle.dump({
+                    'cache': self.cache,
+                    'segments': self.segments
+                }, f)
+            print(f"缓存已保存到 {self.cache_file}，共 {len(self.cache)} 个唯一值")
+    
+    def load_cache(self):
+        """从文件加载缓存"""
         try:
-            with gzip.open(path, "rb") as f:
-                obj = pickle.load(f)
-            meta = obj.get("meta", {})
-            data = obj.get("data", {})
-            if strict and meta.get("fingerprint") != _problem_fingerprint():
-                # 指纹不一致，拒绝加载
-                return {}
-            if merge == "replace":
-                cache.clear()
-                cache.update(data)
-            elif merge == "update":
-                cache.update(data)
-            else:  # "union"
-                for k, v in data.items():
-                    cache.setdefault(k, v)
-            return meta
-        except Exception:
-            return {}
+            with open(self.cache_file, 'rb') as f:
+                data = pickle.load(f)
+                self.cache = data['cache']
+                self.segments = data['segments']
+                print(f"从 {self.cache_file} 加载了 {len(self.cache)} 个唯一缓存值, {len(self.segments)} 个分段")
+        except Exception as e:
+            print(f"加载缓存失败: {e}")
+    
+    def print_stats(self):
+        """打印缓存统计信息"""
+        total = self.hit_count + self.miss_count
+        if total > 0:
+            hit_rate = self.hit_count / total * 100
+            print(f"\n缓存统计: 命中={self.hit_count}, 未命中={self.miss_count}, 命中率={hit_rate:.1f}%")
+            print(f"唯一缓存值数量: {len(self.cache)} / {len(self.segments)} 个可能的分段")
+            print(f"缓存覆盖率: {len(self.cache) / len(self.segments) * 100:.1f}%")
 
-    def _cache_stats() -> dict:
-        return {
-            "size": len(cache),
-            "fingerprint": _problem_fingerprint(),
-        }
+# 创建全局缓存管理器（所有时间段共享）
+cache_manager = SegmentCacheManager(cache_file="pso_cache.pkl")
 
-    def _eval_key(t: int, seg_tuple: tuple[int, ...], mc_seed: int | None = None) -> float:
-        if include_mc_seed_in_cache:
-            key = (int(t),) + tuple(int(s) for s in seg_tuple) + (int(mc_seed or 0),)
-        else:
-            key = (int(t),) + tuple(int(s) for s in seg_tuple)
+# 全局变量，用于在并行进程中访问P_seq
+_global_P_seq = None
 
-        v = cache.get(key, None)
-        if v is not None:
-            return v
+def set_global_P_seq(P_seq):
+    """设置全局P_seq供并行进程使用"""
+    global _global_P_seq
+    _global_P_seq = P_seq
 
-        # 代表点 -> DG 容量向量
-        x_rep = np.zeros(8, dtype=float)
-        for k in range(1, 9):
-            i = seg_tuple[k-1]
-            x_rep[k-1] = _rep_point(t, k, i)
-        dg_cap = {f"DG{k}": float(x_rep[k-1]) for k in range(1, 9)}
+# ========= 定义各个DG的分段点（用户需要根据实际情况修改） =========
+def get_dg_breakpoints():
+    """
+    定义每个DG（分布式电源）的分段点
+    这些分段点应该基于实际供电量的范围来定义
+    
+    注意：分段点应该覆盖 P_seq + x_t 可能的范围
+    """
 
-        # 统一的可复现 seed：默认不使用外部 mc_seed
-        seed = _mix(base_seed, t, *seg_tuple)
-        if include_mc_seed_in_cache and mc_seed is not None:
-            seed = _mix(seed, mc_seed)
+    dim_breakpoints = [
 
-        v = monte_carlo_func(dg_cap, rng_seed=_u32(seed))
-        cache[key] = float(v)
-        return float(v)
+         [0,120,210,330,540,530,750,1035],
+         [0,60,120,180,1035],
+         [0,120,200,220,270,350,420,1035],
+         [0,40,90,130,190,240,280,1035],
+         [0,90,210,280,300,390,400,490,1035],
+         [0,350,420,570,620,770,10000],
+         [0,200,420,620,680,900,1035],
+         [0,150,200,350,400,550,1035],
+    ]
+    
+    
+    return dim_breakpoints
 
-    # ========== 对外的 loss_eval(t, x_t, mc_seed) ==========
-    def loss_eval(t: int, x_t: np.ndarray, mc_seed: int | None = None) -> float:
-        idxs = []
-        xt = np.asarray(x_t, float).reshape(-1)
-        assert xt.shape[0] == 8
-        for k in range(1, 9):
-            idxs.append(_seg_index(t, k, float(xt[k-1])))
-        return _eval_key(t, tuple(idxs), mc_seed=mc_seed)
+# ========= 统一的缓存损失函数 =========
+def compute_with_cache(actual_power: np.ndarray) -> float:
+    _ensure_segments()  # ← 确保本进/线程已建好分段
 
-    # ========== helper 工具 ==========
-        # === 工具 helper：供 PSO 预计算/缓存用（与 t 无关的场景分段） ===
-    class _Helper:
-        def edges_of(self, t: int, k: int) -> list[float]:
-            # 本设计与 t 无关，按 k 返回“绝对出力 y”的分段边界
-            return edges_y[k-1][:]
+    cached_value = cache_manager.get_cached_value(actual_power)
+    if cached_value is not None:
+        return cached_value
 
-        def segment_of(self, t: int, k: int, x: float) -> int:
-            # 把决策 x 映射为当期绝对出力 y=P+x，再定位段索引
-            y = float(P_seq[t-1, k-1] + x)
-            return _seg_idx_y(k, y)
+    dg_capacities = list(actual_power)
+    risk = process_capacity(dg_capacities)
 
-        def eval_key(self, t: int, seg_tuple: tuple[int, ...], mc_seed: int | None = None) -> float:
-            # 直接以“段键”评估一次，并写入缓存（与 loss_eval 使用同一把缓存）
-            key = seg_tuple if not include_mc_seed_in_cache else seg_tuple + (int(mc_seed or 0),)
-            v = cache.get(key)
-            if v is not None:
-                return v
-            # 代表点（绝对出力域），并夹到当期可行区间
-            y_rep = np.array([_rep_y(k+1, seg_tuple[k]) for k in range(8)], dtype=float)
-            y_rep = _clamp_to_feasible_y_for_t(t, y_rep)
-            dg_cap = {f"DG{k+1}": float(y_rep[k]) for k in range(8)}
+    # 某些实现会返回 (loss, over, risk)
+    if isinstance(risk, (tuple, list)) and len(risk):
+        risk = risk[-1]
+    if risk is None or (isinstance(risk, float) and not np.isfinite(risk)):
+        raise RuntimeError(f"process_capacity 返回无效: {risk}（输入: {dg_capacities}）")
 
-            seed = _mix(base_seed, *seg_tuple)
-            if include_mc_seed_in_cache and mc_seed is not None:
-                seed = _mix(seed, mc_seed)
+    value = float(risk)
+    cache_manager.set_cached_value(actual_power, value)
+    return value
+def _ensure_segments():
+    """如果还没有分段，初始化分段"""
+    if not cache_manager.segments:
+        # 初始化分段（分段初始化可能很耗时，所以尽量只初始化一次）
+        dim_breakpoints = get_dg_breakpoints()
+        cache_manager.define_segments_cartesian(dim_breakpoints)
 
-            v = monte_carlo_func(dg_cap, rng_seed=_u32(seed))
-            cache[key] = float(v)
-            return float(v)
 
-        def cache_size(self) -> int:
-            return len(cache)
+# ========= 损失函数包装器 =========
+def loss_fn(t: int, x_t: np.ndarray) -> float:
+    """
+    损失函数包装器
+    t: 时间索引（1-12）
+    x_t: 决策变量，形状(8,)
+    
+    注意：虽然接收t参数（为了保持接口兼容），但实际计算与t无关
+    """
+    global _global_P_seq
+    if _global_P_seq is None:
+        # 如果没有设置全局P_seq，直接把x_t作为实际供电量
+        return compute_with_cache(x_t)
+    
+    # 获取时刻t的原始供电量（注意t是从1开始的）
+    P_seq_t = _global_P_seq[t - 1]
+    
+    # 计算实际供电量 = 原始供电量 + 决策变量
+    actual_power = P_seq_t + x_t
+    
+    # 使用统一的缓存计算（与t无关）
+    return compute_with_cache(actual_power)
 
-        def clear_cache(self):
-            cache.clear()
+# ========= 单个粒子的目标函数（供并行进程调用，必须顶层定义） =========
+def particle_obj(x_single: np.ndarray) -> float:
+    # x_single: shape (12, 8)
+    # 与原 f(X) 完全一致：逐小时求和（t 从 1 到 12）
+    return sum(loss_fn(t + 1, x_single[t]) for t in range(x_single.shape[0]))
 
-        def fingerprint(self) -> str:
-            return _problem_fingerprint()
-
-        def save_cache(self, path: str) -> dict:
-            return _save_cache(path)
-
-        def load_cache(self, path: str, strict: bool = True, merge: str = "union") -> dict:
-            return _load_cache(path, strict=strict, merge=merge)
-
-        def cache_stats(self) -> dict:
-            return _cache_stats()
-
-    # —— 关键：把 evaluator 和 helper 返回给调用方 —— 
-    return loss_eval, _Helper()
-
-# ======= 结束（一站式评估器） =======
-# ========= 约束与可行化（repair/projection） =========
+# ========= 约束与可行化（保持不变） =========
 def build_bounds(P_seq: np.ndarray, Cpv) -> tuple[np.ndarray, np.ndarray]:
-    """
-    P_seq: shape (12, 8)  —— 对应 -x_t <= P(t)  ==>  x_t >= -P(t)
-    Cpv:   shape (8,) 或标量 —— 盒约束：-0.15*Cpv <= x_t <= 0.15*Cpv
-    返回：
-      lo: shape (12, 8)
-      up: shape (12, 8)
-    """
     Cpv = np.asarray(Cpv, dtype=float).reshape(1, -1)  # (1,8)
     if Cpv.shape[1] != P_seq.shape[1]:
         raise ValueError("Cpv 维度与 P_seq 列数不一致")
-    up_box = 0.15 * Cpv           # (1,8)
-    lo_box = -0.15 * Cpv          # (1,8)
-    lo_P   = -np.asarray(P_seq)   # (12,8)
-    lo = np.maximum(lo_box, lo_P) # (12,8): 同时满足 x_t >= -P(t) 与 -0.15*Cpv
-    up = np.broadcast_to(up_box, P_seq.shape)  # (12,8)
+    up_box = 0.15 * Cpv
+    lo_box = -0.15 * Cpv
+    lo_P   = -np.asarray(P_seq)
+    lo = np.maximum(lo_box, lo_P)
+    up = np.broadcast_to(up_box, P_seq.shape)
     return lo, up
 
 def project_prefix_feasible(X: np.ndarray) -> np.ndarray:
-    """
-    将 X (12,8) 投影/修复到满足逐维前缀和约束：forall j, sum_{t=1..j} X[t,k] <= 0
-    算法：逐维扫描，维护累计值 cum_k，强制第 t 步的上界 <= -cum_k
-    注意：调用前应已做盒约束裁剪
-    """
     T, D = X.shape
     X = X.copy()
     cum = np.zeros(D)
     for t in range(T):
-        # 当前步必须满足：X[t] <= -cum（逐维）
         hi_allowed = -cum
-        # 如果某维 hi_allowed < 当前值，则向下裁剪
         mask = X[t] > hi_allowed
         X[t, mask] = hi_allowed[mask]
-        # 更新累计
         cum += X[t]
-        # 保护性数值稳定：允许微小正偏差被拉回
         cum = np.minimum(cum, 0.0)
     return X
 
 def random_feasible(lo: np.ndarray, up: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-    """
-    采样一个可行解 X (12,8)，满足盒约束与前缀和约束
-    策略：逐维构造。对每一维 k，按时间递推，hi_t = min(up[t,k], -cum_k)，
-          再在 [lo[t,k], hi_t] 均匀采样；若区间空则贴边 hi_t。
-    """
     T, D = lo.shape
     X = np.zeros((T, D), dtype=float)
     for k in range(D):
         cum = 0.0
         for t in range(T):
-            hi_t = min(up[t, k], -cum)   # 前缀和≤0
+            hi_t = min(up[t, k], -cum)
             lo_t = float(lo[t, k])
             if hi_t < lo_t:
-                # 区间空，则取 hi_t（最小破坏）
                 x_tk = hi_t
             else:
                 x_tk = rng.uniform(lo_t, hi_t)
             X[t, k] = x_tk
             cum += x_tk
     return X
+def print_stats(self):
+    """打印缓存统计信息"""
+    total = self.hit_count + self.miss_count
+    if total > 0:
+        hit_rate = self.hit_count / total * 100
+        print(f"\n缓存统计: 命中={self.hit_count}, 未命中={self.miss_count}, 命中率={hit_rate:.1f}%")
+        print(f"唯一缓存值数量: {len(self.cache)} / {len(self.segments)} 个可能的分段")
+        print(f"缓存覆盖率: {len(self.cache) / len(self.segments) * 100:.1f}%")
+def _atomic_save_npz(path: Path, **arrays):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")  # 临时文件叫 cap_090.tmp（不带 .npz）
+
+    # 关键：用文件句柄写，Numpy 不会再追加扩展名
+    with open(tmp, "wb") as f:
+        np.savez_compressed(f, **arrays)
+
+    os.replace(tmp, path)  # 原子替换到 cap_090.npz
+
+# ========= PSO 主体 =========
 def pso_optimize(P_seq: np.ndarray,
                  Cpv,
-                 swarm_size: int = 80,
-                 iters: int = 2000,
+                 swarm_size: int = 50,
+                 iters: int = 50,
                  w_start: float = 0.85,
-                 w_end: float   = 0.35,
+                 w_end: float = 0.35,
                  c1: float = 1.6,
                  c2: float = 1.8,
                  seed: int = 2025,
-                 checkpoint_path: str | None = None,
-                 checkpoint_interval: int = 100,
-                 resume: bool = False,
-                 # ===== 分段/缓存控制 =====
-                 segment_breaks: dict[int, list[float]] | dict[tuple[int,int], list[float]] | list[float] | None = None,
-                 representative: str = "midpoint",      # "midpoint" | "left" | "right"
-                 precompute: str = "auto",              # "none" | "auto" | "full"
-                 precompute_limit_per_t: int = 4096,    # 每个时段允许的全预计算上限
-                 include_mc_seed_in_cache: bool = False,
-                 base_seed_for_segments: int = 12345,
-                 # ===== 实体段缓存 =====
-                 segment_cache_path: str | None = None,   # 不给就用指纹自动命名
-                 segment_cache_autoload: bool = True,     # 若存在则自动加载
-                 segment_cache_autosave: bool = False      # 预计算后/每次checkpoint后自动保存
+                 n_jobs: int | None = None,
+                 backend: str = "threads",  # 改成 threads
+                 ckpt_path: str | None = None,
+                 save_every_iter: bool = True,
+                 save_on_improve: bool = True
                  ):
-    """
-    优化变量：X ∈ R^{12×8}（第13时段固定0，不参与优化）
-    目标：sum_{t=1..12} loss_eval(t, X[t], ...)
-    约束：
-      1) 逐元素盒约束：lo <= X <= up，其中 lo = max(-P(t), -0.15*Cpv), up = 0.15*Cpv
-      2) 逐维前缀和：forall j, sum_{t=1..j} X[t,k] <= 0
+    # 其他代码保持不变
 
-    段缓存：
-      - `segment_cache_path` 指定路径；若为 None，将按 seg_helper 指纹自动生成：
-      - 自动加载/保存由 `segment_cache_autoload` / `segment_cache_autosave` 控制。
-    """
-    import os, pickle, time
-    import numpy as np
-    from itertools import product
+    import os, json, time, tempfile
+    from pathlib import Path
+    import os
+    # 设置全局P_seq供损失函数使用
+    set_global_P_seq(P_seq)
 
-    # ---------- 32位安全的种子工具 ----------
-    U32_MASK = 0xFFFFFFFF
-    def _u32(x: int) -> int:
-        return int(x) & U32_MASK
 
-    def _mix_seed(base: int, i: int, t: int) -> int:
-        s = (base ^ 0x9E3779B1) * 0x85EBCA77
-        s ^= (i + 1) * 0xC2B2AE3D
-        s ^= (t + 1) * 0x27D4EB2F
-        return _u32(s)
+    def _load_ckpt(path: Path):
+        if not path or not Path(path).exists():
+            return None
+        try:
+            data = np.load(path, allow_pickle=True)
+            return {k: data[k] for k in data.files}
+        except Exception:
+            return None
 
-    # ---------- checkpoint 工具 ----------
-    def _save_ckpt(path: str, state: dict):
-        with open(path, "wb") as f:
-            pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-    def _load_ckpt(path: str) -> dict:
-        with open(path, "rb") as f:
-            return pickle.load(f)
-
-    def _rng_from_state(state_dict):
-        rng = np.random.default_rng()
-        rng.bit_generator.state = state_dict
-        return rng
-
-    # ---------- 基本设置 ----------
     rng = np.random.default_rng(seed)
     T, D = 12, 8
     if P_seq.shape != (T, D):
         raise ValueError("P_seq 需要形状 (12, 8)")
 
-    # 边界
-    lo, up = build_bounds(P_seq, Cpv)  # (12,8)
+    lo, up = build_bounds(P_seq, Cpv)
 
-    # ====== 分段评估器：创建 loss_eval 与 helper ======
-    # 默认使用你的“真实断点”（绝对断点，左闭右开，最后段右端点并入）
-    if segment_breaks is None:
-        segment_breaks = {
-            1: [0, 420, 750, 1035],
-            2: [0, 120, 180, 1035],
-            3: [0, 320, 420, 1035],
-            4: [0, 130, 280, 1035],
-            5: [0, 300, 490, 1035],
-            6: [0, 420, 770, 1035],
-            7: [0, 620, 1035],
-            8: [0, 350, 550, 1035],
-        }
-
-    loss_eval, seg_helper = make_scenario_loss_evaluator(
-    lo, up, P_seq,
-    breaks=segment_breaks,
-    representative=representative,
-    base_seed=base_seed_for_segments,
-    include_mc_seed_in_cache=include_mc_seed_in_cache,
-    monte_carlo_func=None,
-    # === 新增：让缓存与 cap 无关 ===
-    scope="global",          # 关键参数
-    y_global_min=0.0,        # 你的全局 y 下界（可按需改）
-    y_global_max=1035.0,      # 你的全局 y 上界（建议设为扫掠 cap 的上限）
-)
-
-    # 1) 优先尝试加载“新文件”的全局预计算缓存（兼容路径；不强校验指纹）
-    #    请把下面 compat_cache_path 改成你新文件实际写出的文件路径
-    compat_cache_path = os.path.join(SEG_CACHE_DIR, "mc_seg_global.pkl.gz")
-
-    # 2) 再准备一个“指纹化”的本地缓存路径（可继续沿用）
-    if segment_cache_path is None:
-        segment_cache_path = os.path.join(SEG_CACHE_DIR, f"seg_{seg_helper.fingerprint()}.pkl.gz")
-
-    if segment_cache_autoload:
-        os.makedirs(os.path.dirname(segment_cache_path), exist_ok=True)
-
-        # 先融入全局预计算缓存（不严格校验指纹，做并集）
-        meta_compat = seg_helper.load_cache(compat_cache_path, strict=False, merge="union")
-        if meta_compat:
-            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(meta_compat.get("ts", time.time())))
-            print(f"[段缓存] 已加载全局预计算缓存 {meta_compat.get('size',0)} 键（兼容模式），时间={ts}")
-
-        # 再加载指纹化缓存（若存在则继续合并）
-        meta = seg_helper.load_cache(segment_cache_path, strict=True, merge="union")
-        if meta:
-            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(meta.get("ts", time.time())))
-            print(f"[段缓存] 已加载指纹缓存 {meta.get('size',0)} 键, 指纹={meta.get('fingerprint','')}, 时间={ts}")
-        else:
-            print(f"[段缓存] 未找到可用指纹缓存：{segment_cache_path}")
-
-
-    # ====== 预计算/预热：把常用段提前算进缓存 ======
-    def _make_bar(total: int, prefix: str):
-        import time as _time
-        start = _time.perf_counter()
-        last_pct = -1
-        def update(done: int):
-            nonlocal last_pct
-            done = min(done, total)
-            pct = int(done * 100 / max(1, total))
-            if pct == last_pct and done != total:
-                return
-            last_pct = pct
-            bar_len = 30
-            filled = int(bar_len * done / max(1, total))
-            bar = "█" * filled + " " * (bar_len - filled)
-            elapsed = _time.perf_counter() - start
-            eta = (elapsed / done * (total - done)) if done > 0 else 0.0
-            print(f"\r{prefix} |{bar}| {pct:3d}%  ({done}/{total})  "
-                  f"elapsed {elapsed:5.1f}s  ETA {eta:5.1f}s", end="", flush=True)
-            if done >= total:
-                print("")
-        return update
-
-    def _full_precompute_for_t(t: int) -> int:
-        seg_counts = [len(seg_helper.edges_of(t, k)) - 1 for k in range(1, 9)]
-        total = 1
-        for c in seg_counts:
-            total *= max(1, c)
-        if total <= 0:
-            return 0
-        ranges = [range(max(1, c)) for c in seg_counts]
-        update = _make_bar(total, prefix=f"[预计算] t={t:2d}")
-        cnt = 0
-        step = max(1, total // 100)
-        for seg_tuple in product(*ranges):
-            seg_helper.eval_key(t, tuple(int(s) for s in seg_tuple))
-            cnt += 1
-            if (cnt % step == 0) or (cnt == total):
-                update(cnt)
-        return cnt
-
-    def _shell_precompute_for_t(t: int, hamming_radius: int = 1) -> int:
-        seg_counts = [len(seg_helper.edges_of(t, k)) - 1 for k in range(1, 9)]
-        total = 1 + sum(max(0, c - 1) for c in seg_counts)
-        if hamming_radius >= 2:
-            s1 = [max(0, c - 1) for c in seg_counts]
-            add_r2 = 0
-            for i in range(8):
-                for j in range(i + 1, 8):
-                    add_r2 += s1[i] * s1[j]
-            total += add_r2
-        if total <= 0:
-            return 0
-
-        update = _make_bar(total, prefix=f"[预热]   t={t:2d}")
-
-        # 中心段（优先包含0）
-        center = []
-        for k in range(1, 9):
-            ed = seg_helper.edges_of(t, k)
-            lo_k, up_k = ed[0], ed[-1]
-            x0 = 0.0 if (lo_k <= 0.0 <= up_k) else lo_k
-            center.append(seg_helper.segment_of(t, k, x0))
-        center = tuple(center)
-
-        done_set = set()
-        cnt = 0
-
-        # center
-        seg_helper.eval_key(t, center); done_set.add(center); cnt += 1; update(cnt)
-
-        # r=1：单维扰动
-        for k in range(1, 9):
-            c_k = seg_counts[k - 1]
-            for alt in range(max(1, c_k)):
-                if alt == center[k - 1]:
-                    continue
-                st = list(center); st[k - 1] = alt; st = tuple(st)
-                if st not in done_set:
-                    seg_helper.eval_key(t, st); done_set.add(st); cnt += 1; update(cnt)
-
-        # r=2（可选）
-        if hamming_radius >= 2:
-            for a in range(8):
-                for b in range(a + 1, 8):
-                    for alt_a in range(max(1, seg_counts[a])):
-                        if alt_a == center[a]:
-                            continue
-                        for alt_b in range(max(1, seg_counts[b])):
-                            if alt_b == center[b]:
-                                continue
-                            st = list(center); st[a], st[b] = alt_a, alt_b; st = tuple(st)
-                            if st not in done_set:
-                                seg_helper.eval_key(t, st); done_set.add(st); cnt += 1; update(cnt)
-        return cnt
-
-    precompute_counts = []
-    if precompute.lower() in ("auto", "full"):
-        for t in range(1, 13):
-            seg_counts = [len(seg_helper.edges_of(t, k)) - 1 for k in range(1, 9)]
-            total = 1
-            for c in seg_counts:
-                total *= max(1, c)
-            if precompute.lower() == "full" or total <= precompute_limit_per_t:
-                n = _full_precompute_for_t(t)
-                print(f"[预计算] t={t}: 全枚举 {n} 段键（组合数={total}）")
-                precompute_counts.append(n)
-            else:
-                n = _shell_precompute_for_t(t, hamming_radius=1)
-                print(f"[预热] t={t}: 半径1壳层 {n} 段键（组合数={total} > 上限 {precompute_limit_per_t}）")
-                precompute_counts.append(n)
-        print(f"[预计算完成] 总缓存键数量≈{seg_helper.cache_size()}")
-
-        if segment_cache_path and segment_cache_autosave:
-            meta = seg_helper.save_cache(segment_cache_path)
-            print(f"[段缓存] 预计算后已保存 {meta['size']} 键 → {segment_cache_path}，fp={meta['fingerprint']}")
-
-    # 恢复或初始化
-    it_start = 0
-    if resume and checkpoint_path and os.path.exists(checkpoint_path):
-        try:
-            ckpt = _load_ckpt(checkpoint_path)
-            if ckpt["lo"].shape == lo.shape and ckpt["up"].shape == up.shape:
-                X        = ckpt["X"]
-                V        = ckpt["V"]
-                pbest_X  = ckpt["pbest_X"]
-                pbest_f  = ckpt["pbest_f"]
-                gbest_X  = ckpt["gbest_X"]
-                gbest_f  = ckpt["gbest_f"]
-                it_start = int(ckpt["it"])
-                rng      = _rng_from_state(ckpt["rng_state"])
-                print(f"[恢复] 从 {checkpoint_path} 续跑：已完成 {it_start}/{iters} 轮，当前 gbest={gbest_f:.4f}")
-            else:
-                raise RuntimeError("checkpoint 与当前问题维度不匹配")
-        except Exception as e:
-            print(f"[恢复失败] {e}，重新初始化。")
-            X = np.stack([random_feasible(lo, up, rng) for _ in range(swarm_size)], axis=0)
-            V = rng.normal(scale=0.1, size=X.shape)
-            pbest_X = X.copy()
-            base = _u32(seed ^ 0xA5A5A5A5)
-            pbest_f = np.array([
-                sum(loss_eval(t+1, x[t], mc_seed=_mix_seed(base, i, t)) for t in range(T))
-                for i, x in enumerate(pbest_X)
-            ])
-            g_idx   = int(np.argmin(pbest_f))
-            gbest_X = pbest_X[g_idx].copy()
-            gbest_f = float(pbest_f[g_idx])
+    # 初始化/或从断点恢复
+    start_iter = 0
+    if ckpt_path:
+        ck = _load_ckpt(Path(ckpt_path))
     else:
+        ck = None
+
+    if ck is not None:
+        try:
+            assert tuple(ck["P_seq_shape"]) == tuple(P_seq.shape)
+            assert int(ck["swarm_size"]) == int(swarm_size)
+            X        = ck["X"];           V        = ck["V"]
+            pbest_X  = ck["pbest_X"];     pbest_f  = ck["pbest_f"]
+            gbest_X  = ck["gbest_X"];     gbest_f  = float(ck["gbest_f"])
+            start_iter = int(ck["iter"]) + 1
+            print(f"[{time.strftime('%H:%M:%S')}] 从断点恢复：iter={start_iter}, gbest={gbest_f:.6f}")
+        except Exception:
+            ck = None
+
+    if ck is None:
         X = np.stack([random_feasible(lo, up, rng) for _ in range(swarm_size)], axis=0)
         V = rng.normal(scale=0.1, size=X.shape)
         pbest_X = X.copy()
-        base = _u32(seed ^ 0xA5A5A5A5)
-        pbest_f = np.array([
-            sum(loss_eval(t+1, x[t], mc_seed=_mix_seed(base, i, t)) for t in range(T))
-            for i, x in enumerate(pbest_X)
-        ])
+
+        if backend == "threads":
+            from concurrent.futures import ThreadPoolExecutor as Executor
+        else:
+            from concurrent.futures import ProcessPoolExecutor as Executor
+
+        workers = os.cpu_count() - 9
+        print(f"[{time.strftime('%H:%M:%S')}] 开始PSO优化，群体大小: {swarm_size}, 迭代次数: {iters}，并行后端: {backend}，并行度: {workers}")
+
+        with Executor(max_workers=workers) as executor:
+            pbest_f = np.fromiter(executor.map(particle_obj, pbest_X),
+                                  dtype=float, count=swarm_size)
         g_idx   = int(np.argmin(pbest_f))
         gbest_X = pbest_X[g_idx].copy()
         gbest_f = float(pbest_f[g_idx])
 
-    # 权重线性衰减
+        if ckpt_path:
+            _atomic_save_npz(Path(ckpt_path),
+                             iter=np.array(0, dtype=np.int32),
+                             gbest_f=np.array(gbest_f, dtype=float),
+                             gbest_X=gbest_X,
+                             X=X, V=V,
+                             pbest_X=pbest_X, pbest_f=pbest_f,
+                             lo=lo, up=up,
+                             P_seq=P_seq, Cpv=np.asarray(Cpv, dtype=float),
+                             P_seq_shape=np.array(P_seq.shape, dtype=np.int32),
+                             swarm_size=np.array(swarm_size, dtype=np.int32),
+                             backend=np.array(backend))
+
+    if backend == "threads":
+        from concurrent.futures import ThreadPoolExecutor as Executor
+    else:
+        from concurrent.futures import ProcessPoolExecutor as Executor
+
     def inertia(it):
         return w_start + (w_end - w_start) * (it / max(1, iters - 1))
 
-    print(f"[{time.strftime('%H:%M:%S')}] 开始PSO优化，群体={swarm_size}，总迭代={iters}，从第 {it_start} 轮继续")
-
-    # checkpoint 帮手
-    def _maybe_save_ckpt(it_now: int):
-        if not checkpoint_path:
-            return
-        state = {
-            "it": it_now,
-            "X": X, "V": V,
-            "pbest_X": pbest_X, "pbest_f": pbest_f,
-            "gbest_X": gbest_X, "gbest_f": gbest_f,
-            "lo": lo, "up": up,
-            "rng_state": rng.bit_generator.state,
-        }
-        _save_ckpt(checkpoint_path, state)
-
-    try:
-        for it in range(it_start, iters):
+    with Executor(max_workers=workers) as executor:
+        for it in range(start_iter, iters):
             w = inertia(it)
             r1 = rng.random(size=X.shape)
             r2 = rng.random(size=X.shape)
 
-            # 速度更新
+            X_prev = X
             V = (w * V
                  + c1 * r1 * (pbest_X - X)
                  + c2 * r2 * (gbest_X[np.newaxis, ...] - X))
+            X = X + V
 
-            # 位置更新 + 盒裁剪
-            X = np.minimum(np.maximum(X + V, lo[None, ...]), up[None, ...])
-
-            # 前缀和可行化（逐粒子）
+            X = np.minimum(np.maximum(X, lo[None, ...]), up[None, ...])
             for i in range(swarm_size):
                 X[i] = project_prefix_feasible(X[i])
 
-            # 评估（分段+缓存的 loss_eval）
-            iter_seed = _u32((seed ^ 0xDEADBEEF) + (it + 1) * 0x9E3779B1)
-            vals = np.empty(swarm_size, dtype=float)
-            iter_t0 = time.perf_counter()
-            np.set_printoptions(precision=3, suppress=True, linewidth=200)
+            vals = np.fromiter(executor.map(particle_obj, X),
+                               dtype=float, count=swarm_size)
 
-            chunk_start = time.perf_counter()
-            for i in range(swarm_size):
-                vals[i] = sum(
-                    loss_eval(t+1, X[i, t], mc_seed=_mix_seed(iter_seed, i, t))
-                    for t in range(T)
-                )
-                if ((i + 1) % 5 == 0) or (i + 1 == swarm_size):
-                    start_idx = i - (i % 5) + 1
-                    end_idx   = i + 1
-                    dt = time.perf_counter() - chunk_start
-                    print(f"[{time.strftime('%H:%M:%S')}] 迭代 {it+1:>4}/{iters} | 粒子 {start_idx:>3}~{end_idx:<3} 用时 {dt:.2f}s")
-                    chunk_start = time.perf_counter()
-
-            # 更新个体/全局最优
             improved = vals < pbest_f
             pbest_X[improved] = X[improved]
             pbest_f[improved] = vals[improved]
             gi = int(np.argmin(pbest_f))
-            if pbest_f[gi] < gbest_f:
+            improved_global = pbest_f[gi] < gbest_f
+            if improved_global:
                 gbest_f = float(pbest_f[gi])
                 gbest_X = pbest_X[gi].copy()
 
-            iter_dur = time.perf_counter() - iter_t0
-            print(f"[{time.strftime('%H:%M:%S')}] 迭代 {it+1:>4}/{iters} 完成，用时 {iter_dur:.2f}s | 当前最优损失 gbest={gbest_f:.6f}")
-            print(f"[best X 12×8]\n{gbest_X}\n")
+            if ckpt_path and (save_every_iter or improved_global):
+                _atomic_save_npz(Path(ckpt_path),
+                                 iter=np.array(it, dtype=np.int32),
+                                 gbest_f=np.array(gbest_f, dtype=float),
+                                 gbest_X=gbest_X,
+                                 X=X, V=V,
+                                 pbest_X=pbest_X, pbest_f=pbest_f,
+                                 lo=lo, up=up,
+                                 P_seq=P_seq, Cpv=np.asarray(Cpv, dtype=float),
+                                 P_seq_shape=np.array(P_seq.shape, dtype=np.int32),
+                                 swarm_size=np.array(swarm_size, dtype=np.int32),
+                                 backend=np.array(backend))
 
-            if (it + 1) % 50 == 0 or it == 0:
-                print(f"[{time.strftime('%H:%M:%S')}] PSO迭代 {it+1:>4}/{iters}, gbest={gbest_f:.4f}, w={w:.3f}")
+            if (it + 1) % 10 == 0 or it == 0:
+                print(f"[{time.strftime('%H:%M:%S')}] PSO迭代 {it+1:>4}/{iters}, "
+                      f"当前最优目标值: {gbest_f:.4f}, 惯性权重: {w:.3f}")
+                # 定期打印缓存统计
+                if (it + 1) % 50 == 0:
+                    cache_manager.print_stats()
 
-            # 定期保存检查点 + 段缓存
-            if checkpoint_path and ((it + 1) % int(checkpoint_interval) == 0):
-                _maybe_save_ckpt(it + 1)
-            if segment_cache_path and segment_cache_autosave and ((it + 1) % int(checkpoint_interval) == 0):
-                meta = seg_helper.save_cache(segment_cache_path)
-                print(f"[段缓存] checkpoint 同步保存，size={meta['size']}")
+    # 打印缓存统计
+    cache_manager.print_stats()
+    # 保存缓存
+    cache_manager.save_cache()
 
-        print(f"[{time.strftime('%H:%M:%S')}] PSO优化完成，最终目标值: {gbest_f:.4f}")
-        _maybe_save_ckpt(iters)
-        if segment_cache_path and segment_cache_autosave:
-            meta = seg_helper.save_cache(segment_cache_path)
-            print(f"[段缓存] 最终保存，size={meta['size']} → {segment_cache_path}")
-
-    except KeyboardInterrupt:
-        print("\n[中断] 捕获 KeyboardInterrupt，保存检查点后退出。")
-        _maybe_save_ckpt(it)  # 保存到当前迭代
-        if segment_cache_path and segment_cache_autosave:
-            meta = seg_helper.save_cache(segment_cache_path)
-            print(f"[段缓存] 中断时保存，size={meta['size']} → {segment_cache_path}")
-        raise
-
+    print(f"[{time.strftime('%H:%M:%S')}] PSO优化完成，最终目标值: {gbest_f:.4f}")
     return gbest_f, gbest_X
 
-def make_scenario_loss_evaluator(
-    lo: np.ndarray, up: np.ndarray, P_seq: np.ndarray, breaks,
-    representative="midpoint",
-    base_seed: int = 0,
-    include_mc_seed_in_cache: bool = False,
-    monte_carlo_func=None,
-    scope: str = "global",           # 默认改为 global
-    y_global_min=0.0,
-    y_global_max=1035.0,
-):
-    import numpy as np
-    from bisect import bisect_left
-    import hashlib, json, gzip, pickle, os, time
-
-    assert lo.shape == (12,8) and up.shape == (12,8) and P_seq.shape == (12,8)
-
-    # ---- 断点归一化（保持原逻辑）----
-    def _norm_breaks(bks):
-        if isinstance(bks, list):
-            arr = sorted(float(x) for x in bks)
-            return {k: arr[:] for k in range(1,9)}
-        assert isinstance(bks, dict)
-        keyed_by_tk = any(isinstance(k, tuple) and len(k)==2 for k in bks)
-        out = {}
-        if keyed_by_tk:
-            tmp = {k: [] for k in range(1,9)}
-            for (t,k), arr in bks.items():
-                tmp[int(k)].extend(arr)
-            for k in range(1,9):
-                out[k] = sorted(set(float(x) for x in tmp[k]))
-        else:
-            for k, arr in bks.items():
-                out[int(k)] = sorted(float(x) for x in arr)
-        return out
-    BK = _norm_breaks(breaks)
-
-    # ---- 选择“绝对出力”的包络范围：global（cap无关）或 per_cap（保持旧）----
-    if scope == "global":
-        y_lo_all = np.broadcast_to(np.asarray(y_global_min, float).reshape(-1), (8,))[:8]
-        y_up_all = np.broadcast_to(np.asarray(y_global_max, float).reshape(-1), (8,))[:8]
-    else:  # 旧行为：范围依赖 P_seq/lo/up → 会随 cap 变
-        y_lo_all = (P_seq + lo).min(axis=0)
-        y_up_all = (P_seq + up).max(axis=0)
-
-    # ---- 构造每维的“绝对出力 y 分段边界” edges_y（与 t 无关）----
-    edges_y = [[] for _ in range(8)]
-    for k in range(8):
-        lo_k, up_k = float(y_lo_all[k]), float(y_up_all[k])
-        inner = [b for b in BK.get(k+1, []) if lo_k < b < up_k]
-        arr = [lo_k] + inner + [up_k]
-        dedup = [arr[0]]
-        for v in arr[1:]:
-            if v - dedup[-1] > 1e-9:
-                dedup.append(v)
-        if len(dedup) == 1:
-            dedup = [lo_k, up_k]
-        edges_y[k] = dedup
-
-    # ---- 段索引与代表点 ----
-    def _seg_idx_y(k: int, y: float) -> int:
-        ed = edges_y[k-1]
-        pos = bisect_left(ed, y)
-        return max(0, min(pos-1, len(ed)-2))
-
-    def _rep_y(k: int, i: int) -> float:
-        ed = edges_y[k-1]; a, b = ed[i], ed[i+1]
-        if representative == "left":  return a
-        if representative == "right": return np.nextafter(b, a)
-        return 0.5*(a+b)
-
-    # ---- 指纹（global 模式下不含任何 cap 相关量）----
-    def _problem_fingerprint():
-        payload = {
-            "rep": representative,
-            "include_mc_seed": bool(include_mc_seed_in_cache),
-            "base_seed": int(base_seed),
-            "scope": scope,
-            "edges_y": [[float(x) for x in edges_y[k]] for k in range(8)],
-            "y_lo_all": [float(x) for x in y_lo_all],
-            "y_up_all": [float(x) for x in y_up_all],
-        }
-        s = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        return hashlib.sha1(s.encode("utf-8")).hexdigest()[:16]
-
-    def _save_cache(path: str) -> dict:
-        meta = {"version": 1, "fingerprint": _problem_fingerprint(), "ts": time.time(), "size": len(cache)}
-        obj = {"meta": meta, "data": cache}
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with gzip.open(path, "wb") as f:
-            pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
-        return meta
-
-    def _load_cache(path: str, strict: bool = True, merge: str = "union") -> dict:
-        if not os.path.exists(path):
-            return {}
-        try:
-            with gzip.open(path, "rb") as f:
-                obj = pickle.load(f)
-            meta = obj.get("meta", {}); data = obj.get("data", {})
-            if strict and meta.get("fingerprint") != _problem_fingerprint():
-                return {}
-            if merge == "replace":
-                cache.clear(); cache.update(data)
-            elif merge == "update":
-                cache.update(data)
-            else:  # union
-                for k, v in data.items():
-                    cache.setdefault(k, v)
-            return meta
-        except Exception:
-            return {}
-
-    def _cache_stats() -> dict:
-        return {"size": len(cache), "fingerprint": _problem_fingerprint()}
-
-    # ---- 默认 MC 函数（保持原逻辑）----
-    if monte_carlo_func is None:
-        def monte_carlo_func(dg_capacities: dict, rng_seed: int) -> float:
-            return float(monte_carlo_simulation(dg_capacities, rng_seed=rng_seed))
-
-    # ---- 段键缓存（与 t 无关）----
-    cache = {}
-    U32 = 0xFFFFFFFF
-    def _u32(x:int)->int: return int(x) & U32
-    def _mix(seed:int, *vals:int)->int:
-        s = _u32(seed)
-        for v in vals:
-            s = _u32((s ^ 0x9E3779B1) * 0x85EBCA77 + int(v) * 0xC2B2AE3D)
-        return s
-
-    # 按模式夹代表点（global：夹到全局包络；per_cap：夹到当期可行域）
-    def _clamp_y_for_eval(t:int, y:np.ndarray)->np.ndarray:
-        if scope == "global":
-            return np.minimum(np.maximum(y, y_lo_all), y_up_all)
-        else:
-            y_lo_t = P_seq[t-1] + lo[t-1]
-            y_up_t = P_seq[t-1] + up[t-1]
-            return np.minimum(np.maximum(y, y_lo_t), y_up_t)
-
-    # ---- 对外：loss_eval ----
-    def loss_eval(t:int, x_t:np.ndarray, mc_seed:int|None=None) -> float:
-        x_t = np.asarray(x_t, float).reshape(8,)
-        y_t = P_seq[t-1] + x_t
-        seg = tuple(_seg_idx_y(k+1, float(y_t[k])) for k in range(8))
-        key = seg if not include_mc_seed_in_cache else seg + (int(mc_seed or 0),)
-
-        v = cache.get(key)
-        if v is not None:
-            return v
-
-        y_rep = np.array([_rep_y(k+1, seg[k]) for k in range(8)], float)
-        y_rep = _clamp_y_for_eval(t, y_rep)
-        dg_cap = {f"DG{k+1}": float(y_rep[k]) for k in range(8)}
-
-        seed = _mix(base_seed, *seg)
-        if include_mc_seed_in_cache and mc_seed is not None:
-            seed = _mix(seed, mc_seed)
-
-        v = monte_carlo_func(dg_cap, rng_seed=_u32(seed))
-        cache[key] = float(v)
-        return float(v)
-
-    # ---- Helper（保持接口不变）----
-    class _Helper:
-        def edges_of(self, t:int, k:int) -> list[float]:
-            return edges_y[k-1][:]
-
-        def segment_of(self, t:int, k:int, x:float) -> int:
-            y = float(P_seq[t-1, k-1] + x)
-            return _seg_idx_y(k, y)
-
-        def eval_key(self, t:int, seg_tuple:tuple[int,...], mc_seed:int|None=None) -> float:
-            key = seg_tuple if not include_mc_seed_in_cache else seg_tuple + (int(mc_seed or 0),)
-            v = cache.get(key)
-            if v is not None:
-                return v
-            y_rep = np.array([_rep_y(k+1, seg_tuple[k]) for k in range(8)], float)
-            y_rep = _clamp_y_for_eval(t, y_rep)
-            dg_cap = {f"DG{k+1}": float(y_rep[k]) for k in range(8)}
-
-            seed = _mix(base_seed, *seg_tuple)
-            if include_mc_seed_in_cache and mc_seed is not None:
-                seed = _mix(seed, mc_seed)
-
-            v = monte_carlo_func(dg_cap, rng_seed=_u32(seed))
-            cache[key] = float(v)
-            return float(v)
-
-        def cache_size(self) -> int: return len(cache)
-        def clear_cache(self): cache.clear()
-        def fingerprint(self) -> str: return _problem_fingerprint()
-        def save_cache(self, path:str) -> dict: return _save_cache(path)
-        def load_cache(self, path:str, strict:bool=True, merge:str="union") -> dict:
-            return _load_cache(path, strict=strict, merge=merge)
-        def cache_stats(self) -> dict: return _cache_stats()
-
-    return loss_eval, _Helper()
 
 if __name__ == "__main__":
-    import os, time, atexit
-    import numpy as np
-    import pandas as pd
-    import multiprocessing as mp
+    import time
+    from pathlib import Path
+    import openpyxl
 
-    # —— 多进程与善后 —— 
-    mp.set_start_method('spawn', force=True)
-    atexit.register(cleanup_global_pool)
-
-    print(f"\n===== 扫掠启动 [{time.strftime('%Y-%m-%d %H:%M:%S')}] =====")
-    os.makedirs(BASE_DIR, exist_ok=True)
-    os.makedirs(os.path.join(BASE_DIR, "决策结果"), exist_ok=True)
-    # 如你的 pso_optimize 支持实体段缓存（segment_cache_*），也可建：
-    os.makedirs(SEG_CACHE_DIR, exist_ok=True)
-
-    # —— 你的“真实断点”（左闭右开，最后一段右端点并入）——
-    ABS_BREAKS = {
-        1: [0, 420, 750, 1035],
-        2: [0, 120, 180, 1035],
-        3: [0, 320, 420, 1035],
-        4: [0, 130, 280, 1035],
-        5: [0, 300, 490, 1035],
-        6: [0, 420, 770, 1035],
-        7: [0, 620, 1035],
-        8: [0, 350, 550, 1035],
-    }
+    # ========= 初始化缓存系统（基于笛卡尔积） =========
+    print("正在初始化缓存系统...")
     
-    # —— 以 300 kW 情景为基准出力曲线；其它容量按比例缩放 —— 
-    power_values_300 = [6.21, 68.46, 158.25, 234.78, 282.39, 300.00,
-                        293.04, 267.96, 229.32, 179.16, 119.07, 54.78]
-    base_profile = np.array(power_values_300, dtype=float) / 300.0  # 每 kW 的小时出力
+    # 获取每个DG的分段点（基于实际供电量范围）
+    dim_breakpoints = get_dg_breakpoints()
+    
+    # 使用笛卡尔积方式定义分段
+    cache_manager.define_segments_cartesian(dim_breakpoints)
+    
+    def fmt_sec(s):
+        m, s = divmod(s, 60)
+        h, m = divmod(int(m), 60)
+        return f"{h:d}:{m:02d}:{s:05.2f}"
 
-    def make_P_seq(cap_kw: float) -> np.ndarray:
-        """给定装机 cap_kw -> (12×8) 的小时功率矩阵；8 台同曲线同容量。"""
-        row = base_profile * cap_kw           # (12,)
-        return np.repeat(row[:, None], 8, axis=1)
+    def save_result_row(xlsx_path: Path, row: dict, sheet_name: str = "summary"):
+        xlsx_path.parent.mkdir(parents=True, exist_ok=True)
+        columns = list(row.keys())
+        values  = [row[k] for k in columns]
 
-    summary = []  # 记录每个容量的最优目标
-    best_mats = {}  # cap -> best_X (12x8)
+        if not xlsx_path.exists():
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = sheet_name
+            ws.append(columns)
+            ws.append(values)
+            wb.save(xlsx_path)
+            wb.close()
+        else:
+            wb = openpyxl.load_workbook(xlsx_path)
+            if sheet_name in wb.sheetnames:
+                ws = wb[sheet_name]
+            else:
+                ws = wb.create_sheet(title=sheet_name)
+                ws.append(columns)
+            ws.append(values)
+            wb.save(xlsx_path)
+            wb.close()
 
-    try:
-        for cap in range(30, 901, 10):  # 0,10,...,900
-            print(f"\n============= 情景 cap={cap} kW =============")
-            P_seq = make_P_seq(cap)
-            Cpv   = np.full(8, float(cap))   # 如需每台不同，改成你的 8 维向量
+    print(f"\n===== 分布式电源优化程序启动 [{time.strftime('%Y-%m-%d %H:%M:%S')}] =====")
 
-            ckpt = os.path.join(BASE_DIR, f"pso_cap{cap}.pkl")
+    power_values = [6.21, 68.46, 158.25, 234.78, 282.39, 300.00, 293.04, 267.96, 229.32, 179.16, 119.07, 54.78]
+    base_profile = np.array(power_values, dtype=float) / 300.0
 
-            # —— 关键：把断点给到 pso，并启用分段预计算（自动/全量）——
-            best_f, best_X = pso_optimize(
-                P_seq, Cpv,
-                swarm_size=80, iters=1200,
-                w_start=0.95, w_end=0.25, c1=2.0, c2=2.0, seed=2025,
-                checkpoint_path=ckpt, checkpoint_interval=50, resume=True,
-                segment_breaks=ABS_BREAKS, representative="midpoint",
-                precompute="auto", precompute_limit_per_t=4096,
-                include_mc_seed_in_cache=False, base_seed_for_segments=12345,
-            )
+    caps = list(range(30, 901, 10))
 
-            # 保存本情景结果
-            np.save(os.path.join(BASE_DIR, "决策结果", f"best_X_cap{cap}.npy"), best_X)
-            summary.append({"cap_kW": cap, "best_f": float(best_f)})
-            
-            best_mats[cap] = best_X
+    pso_kwargs = dict(
+        swarm_size=50, iters=10,
+        w_start=0.9, w_end=0.35,
+        c1=1.7, c2=1.7, seed=2025,
+        n_jobs=10,
+        backend="threads",
+    )
 
-    finally:
-        # 汇总无论是否中断都尽量写出
-        if summary:
-            df = pd.DataFrame(summary).sort_values("cap_kW")
-            df.to_csv(os.path.join(BASE_DIR, "决策结果", "summary_cap_100_600_step30.csv"), index=False)
-            print("\n扫掠完成（或已输出部分进度）。汇总：决策结果\\summary_cap_100_600_step30.csv")
-        cleanup_global_pool()
-        print(f"程序结束 [{time.strftime('%Y-%m-%d %H:%M:%S')}]")
-        if summary:
-            df = pd.DataFrame(summary).sort_values("cap_kW")
-            out_xlsx = os.path.join(BASE_DIR, "决策结果", "summary_and_solutions.xlsx")
-            with pd.ExcelWriter(out_xlsx) as writer:  # 让 pandas 自动选用 openpyxl/xlsxwriter
-                # 汇总表（每个cap的最优目标值）
-                df.to_excel(writer, sheet_name="summary", index=False)
+    results_xlsx = Path(__file__).resolve().parent / "结果.xlsx"
+    ckpt_dir     = Path(__file__).resolve().parent / "缓存"
 
-                # 每个cap一个工作表，写12x8的best_X
-                for cap in sorted(best_mats):
-                    X = best_mats[cap]
-                    dfX = pd.DataFrame(
-                        X,
-                        columns=[f"DG{k}" for k in range(1, 9)],
-                        index=[f"t{t}" for t in range(1, 13)]
-                    )
-                    dfX.to_excel(writer, sheet_name=f"cap_{cap}")
+    all_results = []
 
-            print(f"\nExcel 写出完成：{out_xlsx}")
+    t0 = time.time()
+    for cap in caps:
+        ckpt_path = ckpt_dir / f"cap_{cap:03d}.npz"
+
+        print("\n" + "=" * 72)
+        print(f"[{time.strftime('%H:%M:%S')}] 开始容量扫描：Cpv = {cap} kW (每个DG相同)")
+
+        Cpv = np.full(8, cap, dtype=float)
+        P_seq = np.array([Cpv * base_profile[t] for t in range(len(base_profile))], dtype=float)
+
+        print(f"  - 时间段数量: {len(power_values)}")
+        print(f"  - 分布式电源数量: {len(Cpv)}")
+        print(f"  - 装机容量向量: {Cpv.tolist()}")
+
+        start_time = time.time()
+        best_f, best_X = pso_optimize(
+            P_seq, Cpv, **pso_kwargs,
+            ckpt_path=str(ckpt_path),     
+            save_every_iter=True,         
+            save_on_improve=True,
+        )
+        elapsed = time.time() - start_time
+
+        # 打印实际供电量范围，帮助调整分段点
+        actual_power = P_seq + best_X
+        print(f"\n实际供电量统计（用于调整分段点）：")
+        overall_min = actual_power.min()
+        overall_max = actual_power.max()
+        print(f"  总体范围: [{overall_min:.1f}, {overall_max:.1f}]")
+        for dg_idx in range(8):
+            min_val = actual_power[:, dg_idx].min()
+            max_val = actual_power[:, dg_idx].max()
+            print(f"  DG{dg_idx+1}: [{min_val:.1f}, {max_val:.1f}]")
+
+        X13 = np.zeros(8)
+        X_all = np.vstack([best_X, X13])
+        print(f"\n[{time.strftime('%H:%M:%S')}] 容量 {cap} kW 结果：")
+        print(f"  - 最优目标值: {best_f:.6f}")
+        print(f"  - 最优解形状: {best_X.shape}")
+        print(f"  - 最优解统计: min={best_X.min():.3f}, max={best_X.max():.3f}, mean={best_X.mean():.3f}")
+        print(f"  - 完整解序列形状(含第13行0向量): {X_all.shape}")
+        print(f"  - 本轮耗时: {fmt_sec(elapsed)}")
+
+        row = {
+            "cap_kW": int(cap),
+            "best_f": float(best_f),
+            "seconds": float(elapsed),
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "swarm_size": pso_kwargs["swarm_size"],
+            "iters": pso_kwargs["iters"],
+            "backend": pso_kwargs["backend"],
+        }
+        save_result_row(results_xlsx, row)
+        all_results.append((cap, float(best_f), elapsed))
+
+    total_elapsed = time.time() - t0
+    print("\n" + "=" * 72)
+    print(f"===== 全部容量扫描完成 [{time.strftime('%Y-%m-%d %H:%M:%S')}]，总耗时: {fmt_sec(total_elapsed)} =====")
+    print("扫描汇总（cap_kW, best_f, seconds）：")
+    for cap, f, sec in all_results:
+        print(f"  - {cap:>3d} kW : best_f = {f:.6f} , time = {sec:.2f}s")
+    
+    # 最终打印总体缓存统计
+    print("\n" + "=" * 72)
+    cache_manager.print_stats()
