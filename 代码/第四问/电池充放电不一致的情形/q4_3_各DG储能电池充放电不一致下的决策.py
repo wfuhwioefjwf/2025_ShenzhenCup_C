@@ -1530,8 +1530,6 @@ def process_capacity(DG_capacity):
     完成一次基准网络初始化、概率计算、并行计算，并输出Excel结果（若已移除则仅打印累计）。
     """
     # 推断需要的常量
-    cap = DG_capacity[0] if isinstance(DG_capacity, (list, np.ndarray)) else DG_capacity
-    BASE_XLSX_DIR = r"C:\Users\xueyixian\Desktop\深圳杯\第二问\问题二_8.16_测试"
     PROGRESS_INT = 100
     cpu_num = max(1, mp.cpu_count() - 1)
 
@@ -1651,7 +1649,6 @@ def process_capacity(DG_capacity):
                 print(f"  单故障进度 {cnt}/{len(single_args)}")
 
             accumulators = write_row({
-                "capacity": cap,
                 "type": "single",
                 "loc": loc,
                 "best_strategy": strat,
@@ -1664,11 +1661,13 @@ def process_capacity(DG_capacity):
             sum_risk, sum_loss, sum_over, row_count = accumulators
 
             if cnt % PROGRESS_INT == 0:
-                print(f"[{cap} kW] E(loss)={sum_loss:,.2f} E(over)={sum_over:,.2f} "
+                print(f"E(loss)={sum_loss:,.2f} E(over)={sum_over:,.2f} "
+                      f"E(risk)={sum_risk:,.2f}")
+            if cnt % 164 == 0:
+                print(f"E(loss)={sum_loss:,.2f} E(over)={sum_over:,.2f} "
                       f"E(risk)={sum_risk:,.2f}")
 
-        # ---------- 双故障（估计法：仅遍历“不含 L”组合，并按比例外推） ----------
-        # 再按固定比例 0.469760170738439 外推到“全部双故障”的贡献。:contentReference[oaicite:2]{index=2}
+        # ---------- 双故障（估计法：仅遍历“不含 L”组合，并按比例外推） ---------
         ESTIMATE_DOUBLE_RATIO = 0.469760170738439  
         double_args_nol = [(a, b) for (a, b) in double_args
                            if not (a.startswith('L') or b.startswith('L'))]  # :contentReference[oaicite:4]{index=4}
@@ -1694,7 +1693,6 @@ def process_capacity(DG_capacity):
             # 2) 真正计入总账时：把权重放大为 w / ratio，相当于把“不含 L”的样本外推到“全部双故障”
             w_scaled = w / ESTIMATE_DOUBLE_RATIO
             accumulators = write_row({
-                "capacity": cap,
                 "type": "double_est",   # 标注：双故障（估计）
                 "loc": f"{loc1}+{loc2}",
                 "best_strategy": strat,
@@ -1713,7 +1711,8 @@ def process_capacity(DG_capacity):
                       f"E(over)≈{approx_E_over:,.2f} E(risk)≈{approx_E_risk:,.2f}") 
 
     # （收尾汇总打印；不再写Excel）
-    print(f"[{cap} kW] E(loss)={sum_loss:,.2f} E(over)={sum_over:,.2f} E(risk)={sum_risk:,.2f}")
+    print(f"E(loss)={sum_loss:,.2f} E(over)={sum_over:,.2f} E(risk)={sum_risk:,.2f}")
+    return float(sum_loss), float(sum_over), float(sum_risk)
 
 # ========= 分段缓存管理器（统一缓存池） =========
 class SegmentCacheManager:
@@ -1858,16 +1857,15 @@ def get_dg_breakpoints():
 
     dim_breakpoints = [
 
-         [0,120,210,330,540,530,750,1035],
+         [0,120,210,330,540,750,1035],
          [0,60,120,180,1035],
-         [0,120,200,220,270,350,420,1035],
+         [0,120,200,220,300,320,420,1035],
          [0,40,90,130,190,240,280,1035],
          [0,90,210,280,300,390,400,490,1035],
          [0,350,420,570,620,770,10000],
          [0,200,420,620,680,900,1035],
          [0,150,200,350,400,550,1035],
     ]
-    
     
     return dim_breakpoints
 
